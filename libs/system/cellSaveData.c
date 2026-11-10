@@ -445,8 +445,10 @@ static BOOL CALLBACK sd_find_game_window(HWND h, LPARAM lp)
     return FALSE;
 }
 
-/* Returns the chosen index, or -1 when cancelled. */
-static int savedata_host_pick(const wchar_t* caption, wchar_t labels[][160], int n, int def)
+/* Returns the chosen index, or -1 when cancelled. `prompt` (may be NULL) is
+ * a message shown above the list. */
+static int savedata_host_pick(const wchar_t* caption, const wchar_t* prompt,
+                              wchar_t labels[][160], int n, int def)
 {
     static sd_xi_get_fn xi_get; static int xi_tried;
     if (!xi_tried) {
@@ -482,9 +484,12 @@ static int savedata_host_pick(const wchar_t* caption, wchar_t labels[][160], int
                              CLEARTYPE_QUALITY, 0, L"Segoe UI");
     RECT rc; GetClientRect(w, &rc);
     sd_pick_state st = { NULL, 0, def };
+    const int top = prompt ? 124 : 12;
+    HWND text = prompt ? CreateWindowExW(0, L"STATIC", prompt, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                                         12, 12, rc.right - 24, top - 20, w, NULL, inst, NULL) : NULL;
     st.list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-                              12, 12, rc.right - 24, rc.bottom - 70, w, (HMENU)100, inst, NULL);
+                              12, top, rc.right - 24, rc.bottom - 58 - top, w, (HMENU)100, inst, NULL);
     HWND ok = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
                               rc.right - 232, rc.bottom - 46, 106, 34, w, (HMENU)IDOK, inst, NULL);
     HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
@@ -493,6 +498,7 @@ static int savedata_host_pick(const wchar_t* caption, wchar_t labels[][160], int
         SendMessageW(st.list, WM_SETFONT, (WPARAM)font, TRUE);
         SendMessageW(ok, WM_SETFONT, (WPARAM)font, TRUE);
         SendMessageW(cancel, WM_SETFONT, (WPARAM)font, TRUE);
+        if (text) SendMessageW(text, WM_SETFONT, (WPARAM)font, TRUE);
     }
     for (int i = 0; i < n; i++) SendMessageW(st.list, LB_ADDSTRING, 0, (LPARAM)labels[i]);
     SendMessageW(st.list, LB_SETCURSEL, (WPARAM)def, 0);
@@ -530,6 +536,16 @@ static int savedata_host_pick(const wchar_t* caption, wchar_t labels[][160], int
     if (font) DeleteObject(font);
     if (owner) SetForegroundWindow(owner);
     return st.choice < 0 ? -1 : (st.choice < n ? st.choice : def);
+}
+
+/* Yes/No warning in the same window style, so the pad works too. "No" is the
+ * default: a held or repeated OK press can never confirm by accident. */
+static int savedata_host_confirm(const wchar_t* caption, const wchar_t* prompt, const wchar_t* yes)
+{
+    wchar_t opts[2][160];
+    wcscpy(opts[0], L"No, go back");
+    wcsncpy(opts[1], yes, 159); opts[1][159] = 0;
+    return savedata_host_pick(caption, prompt, opts, 2, 0) == 1;
 }
 
 /* "Francesi, 2800 a.C., Capitano   (11/11/2026 00:31)" from the save's
@@ -662,11 +678,22 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
         if (n >= 2) {
             for (int i = 0; i < n; i++) if (!strcmp(names[i], selected)) def = i;
             if (is_save && new_idx >= 0) def = new_idx;   /* never overwrite by default */
-            const int c = savedata_host_pick(is_save ? L"Save game" : L"Load game", labels, n, def);
-            if (c < 0) {
-                printf("[cellSaveData] %s: user cancelled the %s picker%c", who, is_save ? "save" : "load", 10);
-                selected[0] = '\0';
-                return SAVEDATA_PICK_CANCELLED;
+            int c;
+            for (;;) {
+                c = savedata_host_pick(is_save ? L"Save game" : L"Load game", NULL, labels, n, def);
+                if (c < 0) {
+                    printf("[cellSaveData] %s: user cancelled the %s picker%c", who, is_save ? "save" : "load", 10);
+                    selected[0] = '\0';
+                    return SAVEDATA_PICK_CANCELLED;
+                }
+                if (!is_save || c == new_idx) break;
+                /* Saving over an existing game: warn first; "No" goes back to the list. */
+                wchar_t msg[400];
+                _snwprintf(msg, 400, L"Overwrite this saved game?\n%ls\nThe old game will be lost.", labels[c]);
+                msg[399] = 0;
+                if (savedata_host_confirm(L"Overwrite save?", msg, L"Yes, overwrite")) break;
+                printf("[cellSaveData] %s: overwrite of '%s' declined%c", who, names[c], 10);
+                def = c;
             }
             strncpy(selected, names[c], 63); selected[63] = '\0';
         }
@@ -1561,13 +1588,80 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
     return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
 }
 
+#ifdef _WIN32
+/* Delete a save folder and the files in it (save folders are flat, but
+ * recurse anyway). Returns 1 on success. */
+static int savedata_remove_tree(const char* path)
+{
+    char search[1200], child[1200];
+    snprintf(search, sizeof search, "%s\\*", path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+            snprintf(child, sizeof child, "%s\\%s", path, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) savedata_remove_tree(child);
+            else { SetFileAttributesA(child, FILE_ATTRIBUTE_NORMAL); DeleteFileA(child); }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    return RemoveDirectoryA(path) != 0;
+}
+#endif
+
+/* cellSaveDataDelete2 = the PS3 system "delete saved data" list for this
+ * title: the USER picks a save and the system deletes it; the game passes no
+ * name. It used to just return OK, so Civilization Revolution's "delete"
+ * menu did nothing. On Windows the save picker lists the title's saves
+ * (folders starting with its title id), asks "Delete ...?" (default No),
+ * then removes the folder. Cancel -> CELL_SAVEDATA_RET_CANCEL.
+ * Elsewhere, or with SAVEDATA_PICKER=0, it still returns OK and deletes nothing. */
 s32 cellSaveDataDelete2(u32 container)
 {
     printf("[cellSaveData] Delete2(container=%u)\n", container);
+#ifdef _WIN32
+    extern const char* cellGame_get_title_id(void);
+    const char* pk = getenv("SAVEDATA_PICKER");
+    if (pk && pk[0] == '0') return CELL_OK;
+    const char* tid = cellGame_get_title_id();
+    if (!tid || !tid[0]) return CELL_OK;
 
-    /* Without a directory name we can't delete anything meaningful.
-       This variant typically shows a UI for deletion - just succeed. */
+    enum { MAXD = 64 };
+    static CellSaveDataDirList dirs[MAXD];
+    static wchar_t labels[MAXD][160];
+    u32 total = enumerate_save_dirs(tid, dirs, MAXD);
+    int n = (int)(total < MAXD ? total : MAXD);
+    if (n == 0) {
+        printf("[cellSaveData] Delete2: no saves for '%s'%c", tid, 10);
+        return CELL_OK;
+    }
+    for (int i = 0; i < n; i++) savedata_pick_label(dirs[i].dirName, labels[i]);
+
+    int def = 0;
+    for (;;) {
+        const int c = savedata_host_pick(L"Delete save", L"Choose the saved game to delete.", labels, n, def);
+        if (c < 0) {
+            printf("[cellSaveData] Delete2: user cancelled%c", 10);
+            return CELL_SAVEDATA_RET_CANCEL;
+        }
+        wchar_t msg[400];
+        _snwprintf(msg, 400, L"Delete this saved game?\n%ls\nThis cannot be undone.", labels[c]);
+        msg[399] = 0;
+        if (!savedata_host_confirm(L"Delete save?", msg, L"Yes, delete")) { def = c; continue; }
+
+        const char* name = dirs[c].dirName;
+        if (strstr(name, "..") || strchr(name, '/') || strchr(name, '\\')) return CELL_OK;
+        char path[1024];
+        build_save_path(path, sizeof path, name);
+        const int ok = savedata_remove_tree(path);
+        printf("[cellSaveData] Delete2: deleted '%s' -> %s%c", name, ok ? "ok" : "FAILED", 10);
+        return CELL_OK;
+    }
+#else
+    /* No host UI here: without a directory name nothing can be deleted. */
     return CELL_OK;
+#endif
 }
 
 /* ---------------------------------------------------------------------------
