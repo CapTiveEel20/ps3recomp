@@ -76,6 +76,8 @@
 #define M_VB_ELEMENT_BASE       0x173C
 #define M_VTXFMT                0x1740
 #define M_VERTEX_BEGIN_END      0x1808
+#define M_ARRAY_ELEMENT16       0x180C
+#define M_ARRAY_ELEMENT32       0x1810
 #define M_VB_VERTEX_BATCH       0x1814
 #define M_INLINE_ARRAY          0x1818
 #define M_IDXBUF_OFFSET         0x181C
@@ -180,6 +182,7 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
 
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_ARRAY_ELEMENT16,   2, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_INLINE_ARRAY,      1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_INDEX_BATCH,    1, RSX_DSP_CLASS_EXEC);
@@ -450,6 +453,18 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         if (rsx->sink.draw_index_array)
             rsx->sink.draw_index_array(rsx->sink.user, rsx,
                                        arg & 0xFFFFFF, (arg >> 24) + 1);
+        break;
+
+    case M_ARRAY_ELEMENT16:
+        if (rsx->in_begin_end && rsx->sink.array_element) {
+            rsx->sink.array_element(rsx->sink.user, rsx, arg & 0xFFFFu);
+            rsx->sink.array_element(rsx->sink.user, rsx, arg >> 16);
+        }
+        break;
+
+    case M_ARRAY_ELEMENT32:
+        if (rsx->in_begin_end && rsx->sink.array_element)
+            rsx->sink.array_element(rsx->sink.user, rsx, arg);
         break;
 
     case M_GCM_FLIP_HEAD_0:

@@ -228,6 +228,8 @@ static struct {
     u32 n_arr;
     eng_batch idx[ENG_MAX_BATCHES];
     u32 n_idx;
+    u32* elem;
+    u32 n_elem, cap_elem;
     u32 n_packets;
 
     rsx_vertex_ref* refs;
@@ -2387,7 +2389,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
 static void dc_reset(void)
 {
-    dc.n_arr = dc.n_idx = dc.n_packets = 0;
+    dc.n_arr = dc.n_idx = dc.n_elem = dc.n_packets = 0;
     dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
     dc.refs_remapped = 0;
     dc.fetch_ok = 1;
@@ -2516,6 +2518,12 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
             if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
+
+    if (dc.n_elem && dc.fetch_ok) {
+        const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
+        for (u32 i = 0; i < dc.n_elem && dc.fetch_ok; i++)
+            if (!dc_push_ref(dc.elem[i], base_index)) dc.fetch_ok = 0;
+    }
 
     if (dc.n_idx && dc.fetch_ok) {
         const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
@@ -2666,6 +2674,21 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
     dc.idx[dc.n_idx].first = first;
     dc.idx[dc.n_idx].count = count;
     dc.n_idx++;
+}
+
+static void sink_array_element(void* user, const rsx_dispatch* r, u32 index)
+{
+    (void)user; (void)r;
+    dc.n_packets++;
+    if (!dc.fetch_ok) return;
+    if (dc.n_elem >= dc.cap_elem) {
+        const u32 next = dc.cap_elem ? dc.cap_elem * 2u : 4096u;
+        u32* p = (u32*)realloc(dc.elem, (size_t)next * sizeof(u32));
+        if (!p) { dc.fetch_ok = 0; return; }
+        dc.elem = p;
+        dc.cap_elem = next;
+    }
+    dc.elem[dc.n_elem++] = index;
 }
 
 /* Which texture units this draw binds, and from where: a unit naming a
@@ -3279,7 +3302,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     eng_arena_reset();
     /* Mixed geometry sources have no defined concatenation here. Reject the
      * whole group instead of drawing partial/misordered geometry. */
-    if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||
+    if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.n_elem || dc.inl_bytes ||
                           r->inline_dropped != dc.inline_dropped_at_begin)) return;
 
     const u32 prim = g.rsx.current_primitive;
@@ -3705,6 +3728,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.end              = sink_end;
     sink.draw_arrays      = sink_draw_arrays;
     sink.draw_index_array = sink_draw_index;
+    sink.array_element    = sink_array_element;
     sink.inline_array     = sink_inline_array;
     sink.immediate_vertex = sink_immediate_vertex;
     sink.flip             = sink_flip;

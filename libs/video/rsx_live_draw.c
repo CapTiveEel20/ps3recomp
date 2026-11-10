@@ -5080,6 +5080,7 @@ typedef struct {
     const u8* inl; u32 inl_bytes, inl_stride; u32 inl_off[16];
     batch_t arr[256]; u32 n_arr;
     batch_t idx[256]; u32 n_idx;
+    u32*    elem; u32 n_elem, cap_elem;
     u32     n_packets;
     vtx_t*  verts; u32 n_verts, cap_verts;
     rsx_vertex_ref* refs; u32 n_refs, cap_refs;
@@ -5102,7 +5103,7 @@ static draw_ctx dc;
 
 static void dc_reset(void)
 {
-    dc.n_arr = dc.n_idx = dc.n_verts = dc.n_refs = 0;
+    dc.n_arr = dc.n_idx = dc.n_elem = dc.n_verts = dc.n_refs = 0;
     dc.n_source_refs = 0;
     dc.refs_remapped = 0;
     dc.n_packets = 0;
@@ -5299,6 +5300,11 @@ static void fetch_batches(void)
     for (u32 r = 0; r < dc.n_arr && dc.fetch_ok; r++)
         for (u32 i = 0; i < dc.arr[r].count && dc.fetch_ok; i++)
             fetch_one(base, dc.arr[r].first + i, 0);
+    if (dc.n_elem && dc.fetch_ok) {
+        const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
+        for (u32 i = 0; i < dc.n_elem && dc.fetch_ok; i++)
+            fetch_one(base, dc.elem[i], base_index);
+    }
     if (!dc.n_idx) return;
     const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
     rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
@@ -5337,6 +5343,12 @@ static void fetch_batches_hoisted(
     for (u32 batch = 0; batch < dc.n_arr && dc.fetch_ok; batch++)
         for (u32 i = 0; i < dc.arr[batch].count && dc.fetch_ok; i++)
             push_compact_ref(dc.arr[batch].first + i, 0);
+
+    if (dc.n_elem && dc.fetch_ok) {
+        const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
+        for (u32 i = 0; i < dc.n_elem && dc.fetch_ok; i++)
+            push_compact_ref(dc.elem[i], base_index);
+    }
 
     if (dc.n_idx && dc.fetch_ok) {
         const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
@@ -6353,6 +6365,24 @@ static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count
     dc.n_packets++;
     if (dc.n_idx >= 256) { g_ld_stats.packets_queue_full++; return; }
     dc.idx[dc.n_idx].first = first; dc.idx[dc.n_idx].count = count; dc.n_idx++;
+    g_ld_stats.packets_queued++;
+}
+
+static void sink_array_element(void* u, const rsx_dispatch* r, u32 index)
+{
+    (void)u; (void)r; g_ld_stats.packets_seen++;
+    if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) {
+        g_ld_stats.packets_movie++;
+        return;
+    }
+    if (dc.n_elem >= dc.cap_elem) {
+        const u32 nc = dc.cap_elem ? dc.cap_elem * 2u : 4096u;
+        u32* ne = (u32*)realloc(dc.elem, (size_t)nc * sizeof(u32));
+        if (!ne) { dc.fetch_ok = 0; g_ld_stats.packets_queue_full++; return; }
+        dc.elem = ne; dc.cap_elem = nc;
+    }
+    dc.elem[dc.n_elem++] = index;
+    dc.n_packets++;
     g_ld_stats.packets_queued++;
 }
 
@@ -8505,6 +8535,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     sink.draw_arrays = sink_draw_arrays;
     sink.inline_array = sink_inline_array;
     sink.draw_index_array = sink_draw_index;
+    sink.array_element = sink_array_element;
     sink.flip = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
 

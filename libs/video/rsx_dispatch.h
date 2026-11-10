@@ -104,6 +104,11 @@ typedef struct rsx_dispatch_sink {
     void (*draw_arrays)(void* user, const rsx_dispatch* rsx, u32 first, u32 count);
     /* DRAW_INDEX_ARRAY batch: consecutive indices [first, first+count) */
     void (*draw_index_array)(void* user, const rsx_dispatch* rsx, u32 first, u32 count);
+    /* ARRAY_ELEMENT16 (0x180C) / ARRAY_ELEMENT32 (0x1810): vertex-array
+     * indices pushed inline through the FIFO inside BEGIN/END. 0x180C
+     * delivers two 16-bit indices per word (arg & 0xFFFF first, arg >> 16
+     * second); 0x1810 delivers one 32-bit index. */
+    void (*array_element)(void* user, const rsx_dispatch* rsx, u32 index);
     /* INLINE_ARRAY batch: the vertices were pushed through the FIFO itself
      * rather than fetched from memory, so they arrive here instead of as a
      * (first, count) range. `data` is the raw stream in guest byte order and

@@ -293,7 +293,7 @@ def collect_computed_branch_targets(insns, window=8):
 
 
 def collect_jump_table_targets(insns, code, code_start, code_end,
-                               window=48, max_entries=32):
+                               window=48, max_entries=128):
     """Targets reached through an in-code JUMP TABLE:
 
         ila  $r14, 0x1724C          <- TABLE base (an LS address in .text)
@@ -545,6 +545,52 @@ def collect_function_pointer_tables(buf, phs, code_start, code_end,
     return targets
 
 
+def collect_ctor_dtor_targets(buf, phs, shs, code_start, code_end, insns_by_addr):
+    """Constructor/destructor pointers in .ctors/.dtors/.init_array/.fini_array.
+
+    GCC/SNC SPU CRTs walk __CTOR_LIST__..__CTOR_END__ from _start via indirect
+    `bisl $r0, $r4` before calling main(), and __DTOR_LIST__ on exit. Typically
+    only 1 or 2 entries exist (e.g. _GLOBAL__I_*), so collect_function_pointer_tables
+    (min_run=3) skips them, causing _start to abort on an unlifted indirect call
+    before main() runs (observed in CivRev's PhysX SPU tasks spu_0001..spu_0007).
+    """
+    targets = set()
+    for sh in (shs or ()):
+        if sh.get("name") not in (".ctors", ".dtors", ".init_array", ".fini_array"):
+            continue
+        off, sz = sh["off"], sh["size"]
+        seg = buf[off:off + sz]
+        for i in range(0, len(seg) - 3, 4):
+            w = int.from_bytes(seg[i:i + 4], "big")
+            if (w & 3) == 0 and code_start <= w < code_end and w in insns_by_addr:
+                targets.add(w)
+    # Fallback for stripped/raw images: 0xFFFFFFFF, fn1[, fn2...], 0x00000000
+    for ph in (phs or ()):
+        if ph.get("type") != 1:
+            continue
+        off, fsz, vaddr = ph["off"], ph["filesz"], ph["vaddr"]
+        seg = buf[off:off + fsz]
+        skew = (-vaddr) & 3
+        i = skew
+        while i + 12 <= len(seg):
+            if int.from_bytes(seg[i:i + 4], "big") == 0xFFFFFFFF:
+                j = i + 4
+                cands = []
+                while j + 4 <= len(seg) and len(cands) < 64:
+                    w = int.from_bytes(seg[j:j + 4], "big")
+                    if w == 0:
+                        if cands:
+                            targets.update(cands)
+                        break
+                    if (w & 3) == 0 and code_start <= w < code_end and w in insns_by_addr:
+                        cands.append(w)
+                        j += 4
+                    else:
+                        break
+            i += 4
+    return targets
+
+
 # Kept for backwards compatibility / call-only counting.
 def collect_brsl_targets(insns):
     return {t for ins in insns if ins.mnemonic in ("brsl", "brasl")
@@ -653,12 +699,15 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     # hold a small constant cannot seed a bogus function.
     fptr_targets = collect_function_pointer_tables(
         buf, elf["phs"], code_start, code_end, insns_by_addr)
+    ctor_targets = collect_ctor_dtor_targets(
+        buf, elf["phs"], elf.get("shs"), code_start, code_end, insns_by_addr)
     for t in (collect_link_register_targets(insns)
               | collect_computed_branch_targets(insns)
               | collect_jump_table_targets(insns, code, code_start, code_end)
               | collect_ila_continuation_targets(insns, code_start, code_end)
               | collect_duff_targets(insns, code_start, code_end)
-              | fptr_targets):
+              | fptr_targets
+              | ctor_targets):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
             seed_starts.add(t)
     if fptr_targets and verbose:
