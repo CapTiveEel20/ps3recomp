@@ -67,12 +67,14 @@ int lv2_deadline_passed(int64_t deadline)
 uint64_t ppu_timebase_now(void)
 {
 #ifdef _WIN32
-    static LONGLONG t0 = 0;
+    /* Counted from HOST boot, as the PS3 timebase counts from console boot
+     * and as the POSIX path below does. A per-process anchor made every
+     * launch start at 0, so the upper word read 0 for the first ~54 s and
+     * clock-derived seeds repeated run to run. */
     ensure_qpc_init();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
-    uint64_t d = (uint64_t)(now.QuadPart - t0);
+    uint64_t d = (uint64_t)now.QuadPart;
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
     return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
 #else
@@ -359,14 +361,16 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     uint64_t sec, nsec;
 
 #ifdef _WIN32
-    ensure_qpc_init();
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-
-    /* Convert QPC to seconds + nanoseconds */
-    sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
-    uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
-    nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
+    /* Wall-clock time since the Unix epoch, like CLOCK_REALTIME below. This
+     * read QPC (time since host boot), so the guest's time() said early 1970
+     * and anything dated or seeded from it was wrong. FILETIME counts 100 ns
+     * units from 1601-01-01; 11644473600 s separate that from 1970. */
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    const uint64_t t100 = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    const uint64_t unix100 = t100 - 116444736000000000ULL;
+    sec  = unix100 / 10000000ULL;
+    nsec = (unix100 % 10000000ULL) * 100ULL;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

@@ -1030,7 +1030,18 @@ static DWORD WINAPI hang_watchdog(LPVOID)
     snprintf(lbl, sizeof lbl, "%ds sample", t1); dump_threads(lbl, self);
     Sleep((DWORD)(t2 - t1) * 1000);
     snprintf(lbl, sizeof lbl, "%ds sample", t2); dump_threads(lbl, self);
-    return 0;
+    /* F11 while the game window has focus: one more sample, for a hang that
+     * happens at a moment nobody can predict (e.g. loading a save). The
+     * dump lands in stderr like the timed ones. */
+    for (int n = 1;; ) {
+        Sleep(50);
+        HWND fg = GetForegroundWindow();
+        DWORD pid = 0;
+        if (fg) GetWindowThreadProcessId(fg, &pid);
+        if (pid != GetCurrentProcessId() || !(GetAsyncKeyState(VK_F11) & 0x8000)) continue;
+        snprintf(lbl, sizeof lbl, "F11 sample #%d", n++); dump_threads(lbl, self);
+        while (GetAsyncKeyState(VK_F11) & 0x8000) Sleep(50);   /* one per press */
+    }
 }
 #endif
 
