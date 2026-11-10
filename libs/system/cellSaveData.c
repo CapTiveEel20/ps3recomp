@@ -394,6 +394,176 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
  * `selected` receives the chosen directory ("" when none): the first listed
  * entry, else the new-save name, else the focus name. For a save with nothing
  * listed the new-save name wins -- headless, there is no user to pick. */
+static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param);
+
+/* The user cancelled the save/load picker: List{Save,Load}2 return
+ * CELL_SAVEDATA_RET_CANCEL, as when the PS3 user backs out of the list. */
+#define SAVEDATA_PICK_CANCELLED  0x7FFF0001
+#ifndef CELL_SAVEDATA_RET_CANCEL
+#define CELL_SAVEDATA_RET_CANCEL 1
+#endif
+
+#ifdef _WIN32
+/* Host stand-in for the PS3 system save/load list. On a PS3, List{Save,Load}2
+ * show the title's candidates (its fixed list, plus "new data" for a save)
+ * and the USER picks. Headless, the first entry always won, so every save in
+ * Civilization Revolution overwrote LISTSAVE0 and every load read it back.
+ * Shown only when there is a real choice. Keyboard (arrows, Enter, Esc),
+ * mouse (double-click) or an XInput pad (d-pad, A/START = OK, B = cancel).
+ * SAVEDATA_PICKER=0 restores the old first-entry behaviour. */
+typedef struct { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } sd_xi_pad;   /* XINPUT_GAMEPAD */
+typedef struct { DWORD packet; sd_xi_pad pad; } sd_xi_state;                     /* XINPUT_STATE */
+typedef DWORD (WINAPI *sd_xi_get_fn)(DWORD, sd_xi_state*);
+
+typedef struct { HWND list; int done; int choice; } sd_pick_state;
+
+static LRESULT CALLBACK sd_pick_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    sd_pick_state* st = (sd_pick_state*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+    case DM_GETDEFID: return MAKELONG(IDOK, DC_HASDEFID);
+    case WM_COMMAND:
+        if (!st) break;
+        if (LOWORD(wp) == IDOK || (LOWORD(wp) == 100 && HIWORD(wp) == LBN_DBLCLK)) {
+            st->choice = (int)SendMessageW(st->list, LB_GETCURSEL, 0, 0); st->done = 1; return 0;
+        }
+        if (LOWORD(wp) == IDCANCEL) { st->choice = -1; st->done = 1; return 0; }
+        break;
+    case WM_CLOSE:
+        if (st) { st->choice = -1; st->done = 1; }
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static BOOL CALLBACK sd_find_game_window(HWND h, LPARAM lp)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+    *(HWND*)lp = h;
+    return FALSE;
+}
+
+/* Returns the chosen index, or -1 when cancelled. */
+static int savedata_host_pick(const wchar_t* caption, wchar_t labels[][160], int n, int def)
+{
+    static sd_xi_get_fn xi_get; static int xi_tried;
+    if (!xi_tried) {
+        static const wchar_t* const dlls[] = { L"XInput1_4.dll", L"XInput1_3.dll", L"XInput9_1_0.dll" };
+        xi_tried = 1;
+        for (int k = 0; k < 3 && !xi_get; k++) {
+            HMODULE m = LoadLibraryExW(dlls[k], NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (m) xi_get = (sd_xi_get_fn)(void (*)(void))GetProcAddress(m, "XInputGetState");
+        }
+    }
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    static int registered;
+    if (!registered) {
+        WNDCLASSW wc; memset(&wc, 0, sizeof wc);
+        wc.lpfnWndProc = sd_pick_proc; wc.hInstance = inst;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"ps3recomp_savedata_picker";
+        registered = RegisterClassW(&wc) != 0;
+    }
+    HWND owner = NULL;
+    EnumWindows(sd_find_game_window, (LPARAM)&owner);
+    const int W = 560, H = 340;
+    RECT orc = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+    if (owner) GetWindowRect(owner, &orc);
+    HWND w = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT | WS_EX_TOPMOST,
+                             L"ps3recomp_savedata_picker", caption,
+                             WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                             (orc.left + orc.right - W) / 2, (orc.top + orc.bottom - H) / 2, W, H,
+                             owner, NULL, inst, NULL);
+    if (!w) return def;
+    HFONT font = CreateFontW(-18, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                             CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    RECT rc; GetClientRect(w, &rc);
+    sd_pick_state st = { NULL, 0, def };
+    st.list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
+                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                              12, 12, rc.right - 24, rc.bottom - 70, w, (HMENU)100, inst, NULL);
+    HWND ok = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                              rc.right - 232, rc.bottom - 46, 106, 34, w, (HMENU)IDOK, inst, NULL);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                  rc.right - 118, rc.bottom - 46, 106, 34, w, (HMENU)IDCANCEL, inst, NULL);
+    if (font) {
+        SendMessageW(st.list, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(ok, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(cancel, WM_SETFONT, (WPARAM)font, TRUE);
+    }
+    for (int i = 0; i < n; i++) SendMessageW(st.list, LB_ADDSTRING, 0, (LPARAM)labels[i]);
+    SendMessageW(st.list, LB_SETCURSEL, (WPARAM)def, 0);
+    SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)&st);
+    ShowWindow(w, SW_SHOW);
+    SetForegroundWindow(w);
+    SetFocus(st.list);
+
+    /* Pad buttons already held when the picker opens (the press that chose
+     * "save" in the game) must not count as a choice. */
+    WORD prev = 0;
+    sd_xi_state xs;
+    if (xi_get) for (DWORD p = 0; p < 4; p++)
+        if (xi_get(p, &xs) == ERROR_SUCCESS) { prev |= xs.pad.buttons; }
+    while (!st.done) {
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 30, QS_ALLINPUT);
+        MSG m;
+        while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
+            if (!IsDialogMessageW(w, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        }
+        if (!xi_get || st.done) continue;
+        WORD now = 0;
+        for (DWORD p = 0; p < 4; p++)
+            if (xi_get(p, &xs) == ERROR_SUCCESS) now |= xs.pad.buttons;
+        const WORD hit = (WORD)(now & ~prev);
+        prev = now;
+        int cur = (int)SendMessageW(st.list, LB_GETCURSEL, 0, 0);
+        if (hit & 0x0001) SendMessageW(st.list, LB_SETCURSEL, (WPARAM)(cur > 0 ? cur - 1 : 0), 0);      /* up */
+        if (hit & 0x0002) SendMessageW(st.list, LB_SETCURSEL, (WPARAM)(cur < n - 1 ? cur + 1 : n - 1), 0); /* down */
+        if (hit & (0x1000 | 0x0010)) { st.choice = (int)SendMessageW(st.list, LB_GETCURSEL, 0, 0); st.done = 1; } /* A, START */
+        if (hit & 0x2000) { st.choice = -1; st.done = 1; }                                                 /* B */
+    }
+    SetWindowLongPtrW(w, GWLP_USERDATA, 0);
+    DestroyWindow(w);
+    if (font) DeleteObject(font);
+    if (owner) SetForegroundWindow(owner);
+    return st.choice < 0 ? -1 : (st.choice < n ? st.choice : def);
+}
+
+/* "Francesi, 2800 a.C., Capitano   (11/11/2026 00:31)" from the save's
+ * PARAM.SFO and its folder time; the folder name when there is no subtitle. */
+static void savedata_pick_label(const char* dir, wchar_t out[160])
+{
+    char path[1200], text[400];
+    snprintf(path, sizeof path, "%s/%s", s_save_root, dir);
+    CellSaveDataSystemFileParam* p = (CellSaveDataSystemFileParam*)calloc(1, sizeof *p);
+    const char* name = dir;
+    if (p) {
+        read_param_sfo(path, p);
+        size_t k = strlen(p->subTitle);
+        while (k && p->subTitle[k - 1] == ' ') p->subTitle[--k] = '\0';
+        if (k) name = p->subTitle;
+        else if (p->title[0]) name = p->title;
+    }
+    char when[32] = "";
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    for (char* c = path; *c; c++) if (*c == '/') *c = '\\';
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
+        FILETIME lt; SYSTEMTIME s;
+        if (FileTimeToLocalFileTime(&fa.ftLastWriteTime, &lt) && FileTimeToSystemTime(&lt, &s))
+            snprintf(when, sizeof when, "   (%02u/%02u/%04u %02u:%02u)",
+                     s.wDay, s.wMonth, s.wYear, s.wHour, s.wMinute);
+    }
+    snprintf(text, sizeof text, "%s%s", name, when);
+    if (!MultiByteToWideChar(CP_UTF8, 0, text, -1, out, 160))
+        MultiByteToWideChar(CP_ACP, 0, text, -1, out, 160);
+    out[159] = 0;
+    free(p);
+}
+#endif
+
 static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* dirList,
                                 uint32_t dirCount, uint32_t setBuf_ea, int is_save,
                                 uint32_t userdata_ea, const char* who, char selected[64])
@@ -441,6 +611,67 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
         }
         selected[63] = '\0';
     }
+#ifdef _WIN32
+    /* Let the user choose when the title offers more than one candidate:
+     * its fixed list (else the listed directories), plus new data on a save. */
+    const char* pk = getenv("SAVEDATA_PICKER");
+    if (result >= 0 && !(pk && pk[0] == '0')) {
+        enum { MAXC = 64 };
+        static char names[MAXC][64];
+        static wchar_t labels[MAXC][160];
+        int n = 0, def = 0, new_idx = -1;
+        if (is_save && new_name) {
+            for (int i = 0; i < 63; i++) { names[n][i] = (char)vm_read8(new_name + (uint32_t)i); if (!names[n][i]) break; }
+            names[n][63] = '\0';
+            if (names[n][0]) {
+                /* A "new" save must not land on an existing folder: if the
+                 * title's name is taken, use the first free <prefix><number>. */
+                char probe[1200];
+                snprintf(probe, sizeof probe, "%s/%s", s_save_root, names[n]);
+                if (GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES) {
+                    char base[64]; size_t L = strlen(names[n]);
+                    while (L && names[n][L - 1] >= '0' && names[n][L - 1] <= '9') L--;
+                    memcpy(base, names[n], L); base[L] = '\0';
+                    for (int k = 0; k < 1000; k++) {
+                        snprintf(names[n], 64, "%s%d", base, k);
+                        snprintf(probe, sizeof probe, "%s/%s", s_save_root, names[n]);
+                        if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) break;
+                    }
+                }
+                printf("[cellSaveData] %s: new-save folder '%s'%c", who, names[n], 10);
+                MultiByteToWideChar(CP_UTF8, 0, "New save", -1, labels[n], 160);
+                new_idx = n++;
+            }
+        }
+        if (fixed_n && fixed) {
+            for (uint32_t i = 0; i < fixed_n && n < MAXC; i++) {
+                for (int k = 0; k < 32; k++) { names[n][k] = (char)vm_read8(fixed + i * 48u + (uint32_t)k); if (!names[n][k]) break; }
+                names[n][31] = '\0';
+                if (!names[n][0] || (new_idx >= 0 && !strcmp(names[n], names[new_idx]))) continue;
+                savedata_pick_label(names[n], labels[n]);
+                n++;
+            }
+        } else {
+            for (uint32_t i = 0; i < listed && n < MAXC; i++) {
+                strncpy(names[n], dirList[i].dirName, 63); names[n][63] = '\0';
+                if (!names[n][0] || (new_idx >= 0 && !strcmp(names[n], names[new_idx]))) continue;
+                savedata_pick_label(names[n], labels[n]);
+                n++;
+            }
+        }
+        if (n >= 2) {
+            for (int i = 0; i < n; i++) if (!strcmp(names[i], selected)) def = i;
+            if (is_save && new_idx >= 0) def = new_idx;   /* never overwrite by default */
+            const int c = savedata_host_pick(is_save ? L"Save game" : L"Load game", labels, n, def);
+            if (c < 0) {
+                printf("[cellSaveData] %s: user cancelled the %s picker%c", who, is_save ? "save" : "load", 10);
+                selected[0] = '\0';
+                return SAVEDATA_PICK_CANCELLED;
+            }
+            strncpy(selected, names[c], 63); selected[63] = '\0';
+        }
+    }
+#endif
     printf("[cellSaveData] %s returned cbResult.result=%d fixed=%u newData=%s -> '%s'%c",
            who, result, fixed_n, new_name ? "yes" : "no", selected, 10);
     return result;
@@ -1053,6 +1284,10 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
                                           (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
     (void)listSet;
 
+    if (cbResult.result == SAVEDATA_PICK_CANCELLED) {
+        free(dirList);
+        return CELL_SAVEDATA_RET_CANCEL;
+    }
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
@@ -1113,6 +1348,10 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
                                           (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
     (void)listSet;
 
+    if (cbResult.result == SAVEDATA_PICK_CANCELLED) {
+        free(dirList);
+        return CELL_SAVEDATA_RET_CANCEL;
+    }
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
