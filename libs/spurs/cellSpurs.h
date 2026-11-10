@@ -156,7 +156,10 @@ struct CellSpursTaskAttribute {
      * spinning forever. */
     u32  lsPattern_ea;
     u32  argument_ea;
-    u8   _padding[48];
+    /* Guest EA of the CellSpursTaskExitCode set by
+     * cellSpursTaskAttributeSetExitCodeContainer (0 = none). */
+    u32  exitCode_ea;
+    u8   _padding[44];
 };
 
 /* Guest-owned exit container: unlike the legacy host records above, both its
@@ -266,6 +269,9 @@ s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
 
 s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr);
 s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode);
+s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* attr,
+                                               CellSpursTaskExitCode* exitCode);
+s32 cellSpursTaskExitCodeGet(CellSpursTaskExitCode* exitCode, s32* status);
 
 /* ---------------------------------------------------------------------------
  * Workload functions

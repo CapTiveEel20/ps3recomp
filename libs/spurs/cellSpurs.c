@@ -1163,9 +1163,12 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
  * from an EA computed out of r3 = that argument (spu_0003 task main @0x17e70:
  * `wrch $ch18, f(r3.word3)`), so a zero argument makes it GET from EA 0 and
  * stall. lsPattern/argument arrive as guest EAs (generic adapter forwards r3..r10). */
-s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
-                        void* elf, void* context, u32 sizeContext,
-                        u32 lsPattern_ea, u32 argument_ea)
+/* exit_container_ea: guest CellSpursTaskExitCode from the task attribute
+ * (cellSpursTaskAttributeSetExitCodeContainer), 0 when there is none. */
+static s32 spurs_create_task(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                             void* elf, void* context, u32 sizeContext,
+                             u32 lsPattern_ea, u32 argument_ea,
+                             u32 exit_container_ea)
 {
     (void)context; (void)sizeContext;
 
@@ -1238,6 +1241,9 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             /* Register the task in the REAL BE taskset: writes task_info[slot]
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
+            /* Bind (or clear, for a recycled id) the exit-code container
+             * before the task can run: a task may exit straight away. */
+            spu_task_exit_container_bind(taskset_ea, i, exit_container_ea);
             { extern void spu_taskset_mark_running(uint32_t, uint32_t);
               spu_taskset_mark_running(taskset_ea, i); }
             { extern void spu_taskset2_set_exit(uint32_t, uint32_t, int, uint32_t);
@@ -1333,6 +1339,14 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     fprintf(stderr, "[cellSpurs] CreateTask: taskset 0x%08X has no free task id (all 128 enabled)\n",
             taskset_ea);
     return CELL_SPURS_TASK_ERROR_NOMEM;
+}
+
+s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                        void* elf, void* context, u32 sizeContext,
+                        u32 lsPattern_ea, u32 argument_ea)
+{
+    return spurs_create_task(taskset, taskId, elf, context, sizeContext,
+                             lsPattern_ea, argument_ea, 0);
 }
 
 /* The SDK's versioned task-attribute initializer. ABI (8 GPR args):
@@ -1442,11 +1456,12 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
      * dropping them left the TaskInfo with a zero argument + zero lsPattern and
      * the SPU task library then refuses every blocking wait with 0x8041090F --
      * LBP's binkspu movie-IO task spun forever on that). */
-    return cellSpursCreateTask(taskset, taskId,
-                               (void*)(uintptr_t)(u32)attr_h->eaElf,
-                               (void*)(uintptr_t)(u32)attr_h->eaContext,
-                               attr_h->sizeContext,
-                               attr_h->lsPattern_ea, attr_h->argument_ea);
+    return spurs_create_task(taskset, taskId,
+                             (void*)(uintptr_t)(u32)attr_h->eaElf,
+                             (void*)(uintptr_t)(u32)attr_h->eaContext,
+                             attr_h->sizeContext,
+                             attr_h->lsPattern_ea, attr_h->argument_ea,
+                             attr_h->exitCode_ea);
 }
 
 /* CellSpursTaskAttribute2 (256 bytes, big-endian in guest memory):
@@ -1588,6 +1603,48 @@ s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode)
         return (s32)0x8041090Du;
 
     memset((void*)(base + ea), 0, 0x80u);
+    return CELL_OK;
+}
+
+/* NID: 0xA121A224. Remember the container on the attribute; the task created
+ * from it (cellSpursCreateTaskWithAttribute) gets it bound, and its EXIT code
+ * is stored there (spu_workload.c spu_task_exit_container_publish). */
+s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* attr,
+                                               CellSpursTaskExitCode* exitCode)
+{
+    u32 ea = (u32)(uintptr_t)exitCode;
+    if (!attr || !ea) return (s32)CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (ea & 0x7Fu) return (s32)CELL_SPURS_TASK_ERROR_ALIGN;
+    GUEST_PTR(attr, CellSpursTaskAttribute*)->exitCode_ea = ea;
+    return CELL_OK;
+}
+
+/* NID: 0x13AE18F3. Wait until the task bound to this container has exited,
+ * then store its exit code (s32, big-endian) at *status. Civ Rev's culling
+ * waits here for each task's visible-object count and uses it unchecked, so
+ * this must block, not report "not yet". Container record (ours, see
+ * spu_workload.c): +0x00 u32 state (1 = exited), +0x04 u32 code. */
+s32 cellSpursTaskExitCodeGet(CellSpursTaskExitCode* exitCode, s32* status)
+{
+    u32 ea  = (u32)(uintptr_t)exitCode;
+    u32 out = (u32)(uintptr_t)status;
+    if (!ea || !out) return (s32)CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (ea & 0x7Fu) return (s32)CELL_SPURS_TASK_ERROR_ALIGN;
+
+    const uint8_t* c = vm_base + ea;
+    unsigned spins = 0, warned = 0;
+    while (__atomic_load_n(&c[3], __ATOMIC_ACQUIRE) != 1) {
+        /* Tasks finish within a frame: yield first, then sleep 1 ms. */
+        if (++spins < 2000) { Sleep(0); continue; }
+        Sleep(1);
+        if ((spins - 2000) % 2000 == 1999 && warned < 4) {
+            warned++;
+            fprintf(stderr, "[cellSpurs] TaskExitCodeGet(0x%08X): task still running after ~%us\n",
+                    ea, warned * 2);
+        }
+    }
+    u32 code = ((u32)c[4] << 24) | ((u32)c[5] << 16) | ((u32)c[6] << 8) | (u32)c[7];
+    vm_write32(out, code);
     return CELL_OK;
 }
 

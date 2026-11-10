@@ -576,7 +576,63 @@ void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint3
     spu_lockline_unlock();
 }
 
-static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+/* cellSpursTaskAttributeSetExitCodeContainer binds a guest 128-byte
+ * CellSpursTaskExitCode to the task created from that attribute; when the task
+ * EXITs its code is stored there and cellSpursTaskExitCodeGet hands it to the
+ * PPU. Civ Rev's frustum-culling tasks return their visible-object count this
+ * way. Both ends are HLE, so the record is ours (big-endian, the container is
+ * zeroed by cellSpursTaskExitCodeInitialize):
+ *   +0x00 u32 state  0 = task not exited yet, 1 = exited
+ *   +0x04 u32 exit code
+ * Bound per (taskset, task id) by cellSpursCreateTask BEFORE the task can run,
+ * so a task that exits at once still finds its container. */
+#define EXIT_CONT_MAX 256
+static struct { uint32_t ts, task, ea; } s_exit_cont[EXIT_CONT_MAX];
+static volatile LONG s_exit_cont_lock;
+
+void spu_task_exit_container_bind(uint32_t taskset_ea, uint32_t task, uint32_t ea)
+{
+    while (InterlockedExchange(&s_exit_cont_lock, 1)) Sleep(0);
+    int hit = -1, free_i = -1;
+    for (int i = 0; i < EXIT_CONT_MAX; i++) {
+        if (s_exit_cont[i].ea && s_exit_cont[i].ts == taskset_ea && s_exit_cont[i].task == task) { hit = i; break; }
+        if (free_i < 0 && !s_exit_cont[i].ea) free_i = i;
+    }
+    if (hit < 0) hit = ea ? free_i : -1;
+    if (hit >= 0) {
+        s_exit_cont[hit].ts = taskset_ea; s_exit_cont[hit].task = task; s_exit_cont[hit].ea = ea;
+    } else if (ea) {
+        fprintf(stderr, "[spurs] exit-code container table full; task %u of taskset 0x%08X "
+                        "will not report its exit code\n", task, taskset_ea);
+    }
+    InterlockedExchange(&s_exit_cont_lock, 0);
+}
+
+/* Store a finished task's exit code in its bound container (if any) and
+ * unbind it. Code first, then the state word, so a waiter that sees state 1
+ * also sees the code. */
+static void spu_task_exit_container_publish(uint32_t taskset_ea, uint32_t task, uint32_t code)
+{
+    extern uint8_t* vm_base;
+    uint32_t ea = 0;
+    while (InterlockedExchange(&s_exit_cont_lock, 1)) Sleep(0);
+    for (int i = 0; i < EXIT_CONT_MAX; i++)
+        if (s_exit_cont[i].ea && s_exit_cont[i].ts == taskset_ea && s_exit_cont[i].task == task) {
+            ea = s_exit_cont[i].ea; s_exit_cont[i].ea = 0; break;
+        }
+    InterlockedExchange(&s_exit_cont_lock, 0);
+    if (!ea) return;
+    uint8_t* c = vm_base + ea;
+    c[4] = (uint8_t)(code >> 24); c[5] = (uint8_t)(code >> 16); c[6] = (uint8_t)(code >> 8); c[7] = (uint8_t)code;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    c[0] = 0; c[1] = 0; c[2] = 0;
+    __atomic_store_n(&c[3], (uint8_t)1, __ATOMIC_RELEASE);
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 16))
+        fprintf(stderr, "[spurs] task %u of taskset 0x%08X exited code=0x%08X -> container 0x%08X\n",
+                task, taskset_ea, code, ea); }
+}
+
+static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task, uint32_t exit_code)
 {
     extern uint8_t* vm_base;
     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
@@ -585,7 +641,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     ts_lock(); s_ts_held = 1;
     uint8_t* ts = vm_base + taskset_ea;
     uint8_t* run = ts_running(taskset_ea);
-    if (done_task < 128) spu_taskset2_set_exit(taskset_ea, done_task, 1, 0);
+    if (done_task < 128) spu_taskset2_set_exit(taskset_ea, done_task, 1, exit_code);
     if (done_task < 128) {
         extern void spu_taskset_round_drop(uint32_t, uint32_t);
         spu_taskset_round_drop(taskset_ea, done_task);
@@ -644,7 +700,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
  * last exit (Havok's master recreates its workers) was never noticed. */
 void spu_taskset_start_pending(uint32_t taskset_ea)
 {
-    if (taskset_ea) spu_taskset_task_exited(taskset_ea, 0xFFFFFFFFu);
+    if (taskset_ea) spu_taskset_task_exited(taskset_ea, 0xFFFFFFFFu, 0);
 }
 
 static void spu_async_run(spu_async_job* j)
@@ -934,6 +990,7 @@ static void spu_async_run(spu_async_job* j)
                 #undef RDBE32
             }
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
+            spu_task_exit_code_reset();  /* the EXIT syscall records this task's code */
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0, 0);
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
@@ -989,7 +1046,13 @@ static void spu_async_run(spu_async_job* j)
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
-            if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
+            if (j->taskset_ea) {
+                /* A task that returned without the EXIT syscall reports 0. */
+                uint32_t exit_code = 0;
+                (void)spu_task_exit_code_get(&exit_code);
+                spu_task_exit_container_publish(j->taskset_ea, j->taskid, exit_code);
+                spu_taskset_task_exited(j->taskset_ea, j->taskid, exit_code);
+            }
         }
         /* Persistent LS is retained in its taskset slot for the next task; a
          * per-dispatch LS is freed. */

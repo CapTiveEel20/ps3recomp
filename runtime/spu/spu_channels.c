@@ -2323,6 +2323,27 @@ static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
                 (unsigned)bits, wobj); }
 }
 
+/* Exit code of the SPURS task that made the EXIT syscall on this host thread
+ * (each async task runs on its own thread; spu_async_run resets and collects
+ * it). cellSpursTaskExit(code) stores code in the FIRST word of the syscall
+ * argument quadword at LS 0x2FD0 (cwd sp,0 + shufb + stqd 0x2FD0) and only
+ * then makes syscall 0 -- Civ Rev's culling task, image 1 func 0x3900. */
+static _Thread_local int      s_task_exit_valid;
+static _Thread_local uint32_t s_task_exit_code;
+static void spu_task_exit_record(const spu_context* ctx)
+{
+    const uint8_t* a = &ctx->ls[0x2FD0];
+    s_task_exit_code  = ((uint32_t)a[0] << 24) | ((uint32_t)a[1] << 16) |
+                        ((uint32_t)a[2] << 8)  |  (uint32_t)a[3];
+    s_task_exit_valid = 1;
+}
+void spu_task_exit_code_reset(void) { s_task_exit_valid = 0; s_task_exit_code = 0; }
+int spu_task_exit_code_get(uint32_t* code)
+{
+    if (code) *code = s_task_exit_code;
+    return s_task_exit_valid;
+}
+
 void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
@@ -2367,13 +2388,15 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
         { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
             fprintf(stderr, "[spu] cri task EXIT #%d -- halting (was spinning)\n",
                     s_exit_seen); }
+        spu_task_exit_record(ctx);
         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
         spu_halt(ctx);
         return;
     }
     if (num == 0 && (ctx->image_id != 22 || getenv("YDKJ_CRI_EXIT_HALT"))) {
+        spu_task_exit_record(ctx);   /* spu_async_run publishes it after the halt */
         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
-        spu_halt(ctx);          /* longjmp out to spu_run_with_halt; post-run writes exit code */
+        spu_halt(ctx);          /* longjmp out to spu_run_with_halt */
         return;
     }
     /* WAIT_SIGNAL(2): REAL semantics (RPCS3 spursTasksetProcessSyscall) --

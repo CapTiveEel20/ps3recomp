@@ -154,6 +154,13 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 
+/* SPURS task exit codes. The EXIT syscall records the task's code on its host
+ * thread (spu_channels.c); cellSpursCreateTask binds the guest
+ * CellSpursTaskExitCode container (0 = none) the code is published to. */
+void spu_task_exit_code_reset(void);
+int  spu_task_exit_code_get(uint32_t* code);   /* 1 if this thread's task EXITed */
+void spu_task_exit_container_bind(uint32_t taskset_ea, uint32_t task, uint32_t container_ea);
+
 #ifdef __cplusplus
 }
 #endif

@@ -66,7 +66,7 @@ int main(void)
     for (uint32_t flags = 0; flags < 8; flags++) for (int pending = 0; pending < 2; pending++) {
         setup(flags, pending); uint8_t before[48];
         memcpy(before, vm_base + TASKSET + 0x80, sizeof(before));
-        spu_taskset_task_exited(TASKSET, 127);
+        spu_taskset_task_exited(TASKSET, 127, 0);
         CHECK(dispatches == 1, "ready/pending task dispatches with ELF metadata tags");
         CHECK(dispatched_image == vm_base + ELF, "dispatch uses ELF base, not tagged address");
         CHECK(dispatched_size == 100, "real parser receives synthetic ELF header");
@@ -79,25 +79,25 @@ int main(void)
         CHECK(vm_base[TASKSET + 0x20] == 0, "pending-ready bit consumed on submission");
     }
     setup(1, 0); vm_base[TASKSET + 0x30] = 0;
-    spu_taskset_task_exited(TASKSET, 127);
+    spu_taskset_task_exited(TASKSET, 127, 0);
     CHECK(dispatches == 0, "disabled task is not dispatched");
     setup(1, 0); ts_running(TASKSET)[0] = 0x80;
-    spu_taskset_task_exited(TASKSET, 127);
+    spu_taskset_task_exited(TASKSET, 127, 0);
     CHECK(dispatches == 0, "already running task is not duplicated");
     setup(1, 0); vm_base[TASKSET + 0x10] = 0;
-    spu_taskset_task_exited(TASKSET, 127);
+    spu_taskset_task_exited(TASKSET, 127, 0);
     CHECK(dispatches == 0, "enabled task without work is not dispatched");
     setup(1, 0); vm_base[ELF] = 0;
-    spu_taskset_task_exited(TASKSET, 127);
+    spu_taskset_task_exited(TASKSET, 127, 0);
     CHECK(dispatches == 0, "invalid untagged ELF is not dispatched");
     CHECK(s_ts_run[0].running[0] == 0, "invalid ELF leaves host run table clear");
     CHECK(vm_base[TASKSET + 0x10] == 0x80, "invalid ELF preserves ready state");
     setup(7, 1); be32(vm_base + TASKSET + 0x94, 7);
-    spu_taskset_task_exited(TASKSET, 127);
+    spu_taskset_task_exited(TASKSET, 127, 0);
     CHECK(dispatches == 0, "metadata-only null ELF is not dispatched");
     CHECK(vm_base[TASKSET + 0x20] == 0x80, "null ELF preserves pending state");
     setup(1, 0); vm_base[TASKSET + 0x20] = 0x80; ts_running(TASKSET)[0] = 0x80;
-    spu_taskset_task_exited(TASKSET, 0);
+    spu_taskset_task_exited(TASKSET, 0, 0);
     CHECK(dispatches == 0, "exiting task is not restarted");
     CHECK(vm_base[TASKSET + 0x10] == 0 && vm_base[TASKSET + 0x20] == 0 &&
           vm_base[TASKSET + 0x30] == 0 && s_ts_run[0].running[0] == 0,
