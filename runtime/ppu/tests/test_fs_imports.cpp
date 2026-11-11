@@ -92,3 +92,6 @@ int main()
     printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }
+
+/* runtime/syscalls/sys_fs.c is not linked: no raw-syscall fds are open. */
+extern "C" { int sys_fs_fd_in_use(int) { return 0; } FILE* (*g_sys_fs_cellfs_file)(int) = nullptr; }

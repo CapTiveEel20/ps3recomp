@@ -241,11 +241,16 @@ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir 
  * claim the same slot, and every handler reads its slot once (fd_file/fd_dir)
  * rather than re-reading a pointer another thread's close may have cleared. */
 static std::mutex g_fd_lock;
+/* runtime/syscalls/sys_fs.c: the raw sys_fs syscalls' own fd table. One PS3
+ * fd space covers both, so neither side may hand out a number the other has
+ * open (see g_sys_fs_cellfs_file there). */
+extern "C" int sys_fs_fd_in_use(int fd);
+extern "C" FILE* (*g_sys_fs_cellfs_file)(int fd);
 static int fd_alloc_file(FILE* f)
 {
     std::lock_guard<std::mutex> hold(g_fd_lock);
     for (int i = 3; i < FS_MAX; i++)
-        if (!g_files[i] && !g_dirs[i]) {
+        if (!g_files[i] && !g_dirs[i] && !sys_fs_fd_in_use(i)) {
             g_fd_dir[i] = 0;
             __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
             return i;
@@ -256,7 +261,7 @@ static int fd_alloc_dir(DIR* d)
 {
     std::lock_guard<std::mutex> hold(g_fd_lock);
     for (int i = 3; i < FS_MAX; i++)
-        if (!g_files[i] && !g_dirs[i]) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
+        if (!g_files[i] && !g_dirs[i] && !sys_fs_fd_in_use(i)) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
     return -1;
 }
 static FILE* fd_file(int fd)
@@ -1076,6 +1081,7 @@ static void cellFsAioWrite(ppu_context* ctx)
 
 extern "C" void ppu_fs_register(void)
 {
+    g_sys_fs_cellfs_file = fd_file;   /* sys_fs syscalls on cellFs fds */
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
     /* Register by the literal import NID: LBP imports 0xB1840B53 for
      * cellFsSdataOpen, which ps3_compute_nid("cellFsSdataOpen") does NOT match

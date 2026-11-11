@@ -32,6 +32,46 @@ sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
 
+/* The cellFs HLE (runtime/ppu/ppu_fs.cpp) keeps its own fd table, but on a
+ * PS3 cellFsOpen and the raw sys_fs syscalls share ONE kernel fd space: a
+ * title may open with cellFsOpen and then read the same fd with syscall 802.
+ * Civilization Revolution hands its cellFsOpen'd movie fd to Bink
+ * (BINKFILEHANDLE), whose reader seeks and reads with syscalls 818/802 --
+ * here those answered EBADF, BinkOpen failed on the header, and no movie
+ * ever played. ppu_fs.cpp registers this lookup so the syscalls can use its
+ * FILE*; each side also skips fd numbers the other has open, so the two
+ * tables never hand out the same number. NULL when ppu_fs.cpp is not linked. */
+FILE* (*g_sys_fs_cellfs_file)(int fd) = NULL;
+
+/* Is this fd number open in the syscall table? (ppu_fs.cpp allocation) */
+int sys_fs_fd_in_use(int fd)
+{
+    const int slot = fd - 3;
+    return slot >= 0 && slot < SYS_FS_FD_MAX && g_sys_fs_fds[slot].active;
+}
+
+/* The host stream for an fd from either table, or NULL. path gets the
+ * host path when known ("(cellFs)" otherwise). */
+static FILE* sys_fs_fd_stream(int32_t fd, const char** path)
+{
+    const int slot = fd - 3;
+    if (slot >= 0 && slot < SYS_FS_FD_MAX) {
+        sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+        if (f->active && f->fp) {
+            if (path) *path = f->path;
+            return f->fp;
+        }
+    }
+    if (g_sys_fs_cellfs_file) {
+        FILE* fp = g_sys_fs_cellfs_file(fd);
+        if (fp) {
+            if (path) *path = "(cellFs)";
+            return fp;
+        }
+    }
+    return NULL;
+}
+
 /* fd and dir-fd slots are claimed and released under this lock. These
  * syscalls are live from several guest threads at once (one thread opens a
  * file while another is mid-read on its own), and the unlocked
@@ -493,7 +533,10 @@ int64_t sys_fs_open(ppu_context* ctx)
     fs_slot_lock();
     int slot = -1;
     for (int i = 0; i < SYS_FS_FD_MAX; i++) {
-        if (!g_sys_fs_fds[i].active) { slot = i; break; }
+        if (g_sys_fs_fds[i].active) continue;
+        /* fd i+3 already belongs to a cellFsOpen'd file (one fd space). */
+        if (g_sys_fs_cellfs_file && g_sys_fs_cellfs_file(i + 3)) continue;
+        slot = i; break;
     }
     if (slot < 0) {
         fs_slot_unlock();
@@ -532,23 +575,20 @@ int64_t sys_fs_read(ppu_context* ctx)
     uint64_t size       = LV2_ARG_U64(ctx, 2);
     uint32_t nread_addr = LV2_ARG_PTR(ctx, 3);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    const char* fpath = "";
+    FILE* fp = sys_fs_fd_stream(fd, &fpath);
+    if (!fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
     void* buf = vm_to_host(buf_addr);
-    long pos_before = ftell(f->fp);
+    long pos_before = ftell(fp);
     /* The VM commits pages on first user-mode touch; a read the CRT hands to
      * the kernel (anything past its 4 KB buffer) into a still-reserved page
      * fails instead, and fread comes back short. GH3's Bink reader saw that
      * as a read error on every movie and never decoded a frame -- solid green
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
     if (size) vm_commit(buf_addr, (uint32_t)size);
-    size_t nread = fread(buf, 1, (size_t)size, f->fp);
+    size_t nread = fread(buf, 1, (size_t)size, fp);
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
      *
@@ -578,7 +618,7 @@ int64_t sys_fs_read(ppu_context* ctx)
         const unsigned char* b = (const unsigned char*)buf;
         fprintf(stderr, "[FSDBG] read fd=%d '%s' pos=%ld want=%llu got=%zu"
                         " head=%02X%02X%02X%02X lr=0x%08X\n",
-                fd, f->path, pos_before, (unsigned long long)size, nread,
+                fd, fpath, pos_before, (unsigned long long)size, nread,
                 nread > 0 ? b[0] : 0, nread > 1 ? b[1] : 0,
                 nread > 2 ? b[2] : 0, nread > 3 ? b[3] : 0,
                 (uint32_t)ctx->lr);
@@ -602,24 +642,17 @@ int64_t sys_fs_write(ppu_context* ctx)
     uint64_t size         = LV2_ARG_U64(ctx, 2);
     uint32_t nwritten_addr = LV2_ARG_PTR(ctx, 3);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX) {
+    FILE* fp = sys_fs_fd_stream(fd, NULL);
+    if (!fp) {
         /* Invalid fd — pretend write succeeded (CRT stdio uses corrupted fds) */
         if (nwritten_addr != 0)
             write_be64(nwritten_addr, size);
         return CELL_OK;
     }
 
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp) {
-        if (nwritten_addr != 0)
-            write_be64(nwritten_addr, size);
-        return CELL_OK;
-    }
-
     const void* buf = vm_to_host(buf_addr);
-    size_t nwritten = fwrite(buf, 1, (size_t)size, f->fp);
-    fflush(f->fp);
+    size_t nwritten = fwrite(buf, 1, (size_t)size, fp);
+    fflush(fp);
 
     if (nwritten_addr != 0) {
         write_be64(nwritten_addr, (uint64_t)nwritten);
@@ -670,17 +703,10 @@ int64_t sys_fs_lseek(ppu_context* ctx)
     int32_t  whence    = LV2_ARG_S32(ctx, 2);
     uint32_t pos_addr  = LV2_ARG_PTR(ctx, 3);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX) {
+    FILE* fp = sys_fs_fd_stream(fd, NULL);
+    if (!fp) {
         /* Invalid fd — return position 0 instead of EBADF.
          * The CRT may call lseek on uninitialized FILE structures. */
-        if (pos_addr)
-            write_be64(pos_addr, 0);
-        return 0;
-    }
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp) {
         if (pos_addr)
             write_be64(pos_addr, 0);
         return 0;
@@ -699,19 +725,19 @@ int64_t sys_fs_lseek(ppu_context* ctx)
      * call and the stream then reports the OS position, which is past the
      * buffered data, so the old position is put back explicitly. */
 #ifdef _WIN32
-    const int64_t before = _ftelli64(f->fp);
-    if (_fseeki64(f->fp, offset, origin) != 0) {
-        if (before >= 0) _fseeki64(f->fp, before, SEEK_SET);
+    const int64_t before = _ftelli64(fp);
+    if (_fseeki64(fp, offset, origin) != 0) {
+        if (before >= 0) _fseeki64(fp, before, SEEK_SET);
         return (int64_t)(int32_t)CELL_EINVAL;
     }
-    int64_t pos = _ftelli64(f->fp);
+    int64_t pos = _ftelli64(fp);
 #else
-    const off_t before = ftello(f->fp);
-    if (fseeko(f->fp, (off_t)offset, origin) != 0) {
-        if (before >= 0) fseeko(f->fp, before, SEEK_SET);
+    const off_t before = ftello(fp);
+    if (fseeko(fp, (off_t)offset, origin) != 0) {
+        if (before >= 0) fseeko(fp, before, SEEK_SET);
         return (int64_t)(int32_t)CELL_EINVAL;
     }
-    int64_t pos = (int64_t)ftello(f->fp);
+    int64_t pos = (int64_t)ftello(fp);
 #endif
 
     if (pos_addr != 0) {
@@ -797,20 +823,16 @@ int64_t sys_fs_fstat(ppu_context* ctx)
     int32_t  fd        = LV2_ARG_S32(ctx, 0);
     uint32_t stat_addr = LV2_ARG_PTR(ctx, 1);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    FILE* fp = sys_fs_fd_stream(fd, NULL);
+    if (!fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
     struct stat st;
 #ifdef _WIN32
-    int fno = _fileno(f->fp);
+    int fno = _fileno(fp);
     if (_fstat64(fno, (struct _stat64*)&st) != 0)
 #else
-    int fno = fileno(f->fp);
+    int fno = fileno(fp);
     if (fstat(fno, &st) != 0)
 #endif
     {
@@ -1140,22 +1162,18 @@ int64_t sys_fs_ftruncate(ppu_context* ctx)
     int32_t  fd   = LV2_ARG_S32(ctx, 0);
     uint64_t size = LV2_ARG_U64(ctx, 1);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
+    FILE* fp = sys_fs_fd_stream(fd, NULL);
+    if (!fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    fflush(f->fp);
+    fflush(fp);
 
 #ifdef _WIN32
-    int fno = _fileno(f->fp);
+    int fno = _fileno(fp);
     if (_chsize_s(fno, (long long)size) != 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 #else
-    int fno = fileno(f->fp);
+    int fno = fileno(fp);
     if (ftruncate(fno, (off_t)size) != 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 #endif

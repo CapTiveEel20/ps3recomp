@@ -56,3 +56,6 @@ int main(int argc, char** argv) {
     assert(uint32_t(call(fd,312).gpr[3])==0x8001002Au);
     puts("PASS: PPU directory-entry ABI, batching, bounds, errors, and EOF");
 }
+
+/* runtime/syscalls/sys_fs.c is not linked: no raw-syscall fds are open. */
+extern "C" { int sys_fs_fd_in_use(int) { return 0; } FILE* (*g_sys_fs_cellfs_file)(int) = nullptr; }
