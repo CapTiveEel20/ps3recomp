@@ -290,6 +290,10 @@ typedef struct {
     ID3D12Device*              dev;
     ID3D12CommandQueue*        queue;
     ID3D12CommandAllocator*    alloc;
+    /* Allocator of the frame still on the GPU after an asynchronous present
+     * (ld_flush_present_async), and the fence value that frees it. */
+    ID3D12CommandAllocator*    alloc_spare;
+    u64                        alloc_spare_fence;
     ID3D12GraphicsCommandList* list;
     ID3D12Fence*               fence;
     HANDLE                     fence_event;
@@ -1802,6 +1806,95 @@ void rsx_live_draw_flush(void)
     if (g.ready) ld_flush(LD_FLUSH_GUEST_REFERENCE);
 }
 
+/* Block until the GPU has finished everything submitted so far (not the
+ * commands still being recorded). A NULL event makes SetEventOnCompletion
+ * itself wait, so this is safe from a thread other than the ticker. */
+static void ld_wait_submitted(void)
+{
+    if (g.fence && g.fence->lpVtbl->GetCompletedValue(g.fence) < g.fence_value)
+        g.fence->lpVtbl->SetEventOnCompletion(g.fence, g.fence_value, NULL);
+}
+
+/* Present-time flush that does not wait for this frame's GPU work.
+ *
+ * ld_flush waits until the GPU is idle. At present that wait (measured: ~28%
+ * of the ticker thread in a Civilization Revolution match) runs while nothing
+ * else happens: the ticker can't drain the next frame's FIFO and the guest
+ * sits in its wait-for-flip loop. Here the frame is submitted and the ticker
+ * goes on with the next one while the GPU draws; at most ONE frame stays in
+ * flight, because the allocator swapped in is the previous frame's and is
+ * waited for first.
+ *
+ * Why this is safe with the rest of the renderer:
+ *  - vertex / index / constant / descriptor rings only restart after a full
+ *    ld_flush (ring full), so a frame in flight is never overwritten;
+ *  - the texture upload area is NOT reset here (ld_flush resets it once the
+ *    GPU is idle); an upload that no longer fits does a full ld_flush first
+ *    (ld_upload_make_room);
+ *  - retired textures are released only by a full ld_flush;
+ *  - movies (fixed-offset uploads) keep the synchronous ld_flush, and
+ *    rsx_live_draw_present_rgba waits for submitted work before writing.
+ * OPT-IN (RSX_ASYNC_PRESENT=1). Civilization Revolution ran ~5 FPS faster in
+ * a match with it, but its terrain lighting/shadows flickered (dark smudges
+ * that alternate frame to frame) and did not with the synchronous path; the
+ * cause is not found yet, so the default stays synchronous. */
+static void ld_flush_present_async(void)
+{
+    static int sync_only = -1;
+    if (sync_only < 0) { const char* e = getenv("RSX_ASYNC_PRESENT"); sync_only = !(e && e[0] == '1'); }
+    if (sync_only || !g.alloc_spare) { ld_flush(LD_FLUSH_PRESENT); return; }
+
+    const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
+    if (FAILED(close_hr)) {
+        fprintf(stderr, "[d3d-fail] command-list Close hr=0x%08lX frame=%u\n",
+                (unsigned long)close_hr, g_ld_frames);
+        ld_dump_dred("Close", close_hr);
+        g.ready = 0;
+        return;
+    }
+    ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    const u64 v = ++g.fence_value;
+    const HRESULT signal_hr = g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+    if (FAILED(signal_hr)) {
+        fprintf(stderr, "[d3d-fail] queue Signal hr=0x%08lX frame=%u\n",
+                (unsigned long)signal_hr, g_ld_frames);
+        ld_dump_dred("Signal", signal_hr);
+        g.ready = 0;
+        return;
+    }
+    /* The spare allocator holds the previous frame: wait for it, so no more
+     * than one frame is ever in flight. */
+    if (g.fence->lpVtbl->GetCompletedValue(g.fence) < g.alloc_spare_fence) {
+        if (FAILED(g.fence->lpVtbl->SetEventOnCompletion(g.fence, g.alloc_spare_fence, g.fence_event))) {
+            ld_flush(LD_FLUSH_PRESENT);
+            return;
+        }
+        WaitForSingleObject(g.fence_event, INFINITE);
+    }
+    ld_drain_info_queue("flush");
+    ID3D12CommandAllocator* const next = g.alloc_spare;
+    g.alloc_spare = g.alloc;
+    g.alloc_spare_fence = v;
+    g.alloc = next;
+    g.alloc->lpVtbl->Reset(g.alloc);
+    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+}
+
+/* Texture uploads append to the upload area until a full ld_flush resets it.
+ * With asynchronous presents that reset no longer happens every frame, so a
+ * texture that does not fit waits for the GPU here instead of being dropped.
+ * Returns the (512-aligned) start offset for `bytes`. */
+static u32 ld_upload_make_room(u64 bytes)
+{
+    u32 start = (g.upload_used + 511) & ~511u;
+    if ((u64)start + bytes > UPLOAD_SIZE && g.upload_used) {
+        ld_flush(LD_FLUSH_RETIRE_QUEUE);   /* waits for the GPU; resets upload_used */
+        start = (g.upload_used + 511) & ~511u;
+    }
+    return start;
+}
+
 static void retire_texture(ID3D12Resource* tex)
 {
     if (!tex) return;
@@ -1929,7 +2022,7 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
         return NULL;
     for (u32 m = 0; m < n; m++) {
         const u32 pitch = (lv[m].row_bytes + 255) & ~255u;
-        const u32 start = (g.upload_used + 511) & ~511u;
+        const u32 start = ld_upload_make_room((u64)pitch * lv[m].rows);
         if ((u64)start + (u64)pitch * lv[m].rows > UPLOAD_SIZE) break;
         for (u32 y = 0; y < lv[m].rows; y++)
             memcpy(g.upload_mapped + start + (size_t)y * pitch,
@@ -1982,7 +2075,7 @@ static ID3D12Resource* create_texture_cube(
         for (u32 mip = 0; mip < n_mips; mip++) {
             const tex_level_t* level = &lv[face * n_mips + mip];
             const u32 pitch = (level->row_bytes + 255) & ~255u;
-            const u32 start = (g.upload_used + 511) & ~511u;
+            const u32 start = ld_upload_make_room((u64)pitch * level->rows);
             if ((u64)start + (u64)pitch * level->rows > UPLOAD_SIZE) {
                 tex->lpVtbl->Release(tex);
                 return NULL;
@@ -8389,6 +8482,9 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     g.dev->lpVtbl->CreateCommandQueue(g.dev, &qd, &IID_ID3D12CommandQueue, (void**)&g.queue);
     g.dev->lpVtbl->CreateCommandAllocator(g.dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
                                           &IID_ID3D12CommandAllocator, (void**)&g.alloc);
+    if (FAILED(g.dev->lpVtbl->CreateCommandAllocator(g.dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                     &IID_ID3D12CommandAllocator, (void**)&g.alloc_spare)))
+        g.alloc_spare = NULL;   /* ld_flush_present_async then falls back to ld_flush */
     g.dev->lpVtbl->CreateCommandList(g.dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc, NULL,
                                      &IID_ID3D12GraphicsCommandList, (void**)&g.list);
     if (g.queue) g.queue->lpVtbl->SetName(g.queue, L"rsx-live-queue");
@@ -8854,6 +8950,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
         return;
     }
 
+    ld_wait_submitted();   /* a frame may still be in flight (async present) */
     u8* host_upload = composite ? g.movie_upload_mapped : g.upload_mapped;
     for (u32 y = 0; y < h; y++) {
         u8* dstrow = host_upload + (size_t)y * pitch;
@@ -9458,7 +9555,8 @@ void rsx_live_draw_present(u32 buffer_id)
     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
 
-    ld_flush(LD_FLUSH_PRESENT);
+    if (g_ld_movie_mode) ld_flush(LD_FLUSH_PRESENT);
+    else                 ld_flush_present_async();
     {
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
         if (SUCCEEDED(present_hr))
