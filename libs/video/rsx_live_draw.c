@@ -480,6 +480,8 @@ static u32 g_ld_last_requested_buffer = UINT32_MAX;
 static u32 g_ld_last_consumed_buffer = UINT32_MAX;
 static u32 g_ld_last_present_target = UINT32_MAX;
 static u64 g_ld_last_dump_fingerprint = 0;
+/* Executed draws per surface since the last present (LD_BLACK_DBG report). */
+static u32 g_ld_frame_tdraws[MAX_SURFACES];
 #if !defined(YZ_PERF_CLEAN)
 static u32 g_ld_surface_generation = 0;
 static u32 g_ld_surface_resource_serial = 0;
@@ -8331,17 +8333,41 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                     break;
                 }
         if (!zeta_pref) { u32 best_gen = 0;
+          /* Several surfaces can share one address (same offset, different
+           * size or format). Of those matching the texture's size, take the
+           * one written LAST: guest memory holds the newest write. Taking the
+           * first in table order read a stale one -- Civ Rev's depth-of-field
+           * chain (leader/advisor scenes) blurs 0x1A00000 as A8R8G8B8
+           * 1280x720 right after drawing it, but the FP16 fog accumulation
+           * buffer at the same offset and size sat earlier in the table, so
+           * the blur read near-black fog data and the frame went black.
+           * LD_ALIAS_FIRST=1 = old first-match behaviour. */
+          static int alias_first = -1;
+          if (alias_first < 0) { const char* e = getenv("LD_ALIAS_FIRST"); alias_first = e && e[0] == '1'; }
+          int exact = -1; u32 exact_gen = 0;
           for (u32 i = 0; i < g.n_surfaces; i++) {
               const surface_t* sf_i = &g.surfaces[i];
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
                   i == target)
                   continue;
-              if (sf_i->w == t.width && sf_i->h == t.height) { sampled = (int)i; break; }
+              if (sf_i->w == t.width && sf_i->h == t.height) {
+                  if (alias_first) { exact = (int)i; break; }
+#if !defined(YZ_PERF_CLEAN)
+                  if (exact < 0 || sf_i->last_write_generation > exact_gen) {
+                      exact = (int)i;
+                      exact_gen = sf_i->last_write_generation;
+                  }
+#else
+                  if (exact < 0) exact = (int)i;
+#endif
+                  continue;
+              }
               if (sampled < 0 || sf_i->last_draw_generation > best_gen) {
                   sampled = (int)i;
                   best_gen = sf_i->last_draw_generation;
               }
-          } }
+          }
+          if (exact >= 0) sampled = exact; }
         /* LD_UVDBG=1: the texture coordinates of the draw that samples the PS1
          * framebuffer. Placed here rather than in fetch_batches because that
          * function is not on this draw's path -- probing it printed nothing at
@@ -8795,6 +8821,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             z->had_write = 1;
     }
     g_ld_stats.groups_executed++;
+    if (target < MAX_SURFACES) g_ld_frame_tdraws[target]++;
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.input_vertices += dc.n_source_refs;
     g_ld_profile.total.expanded_vertices += n_tri;
@@ -10192,6 +10219,139 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
     fflush(stderr);
 }
 
+/* LD_BLACK_DBG=1: find single black frames between normal ones.
+ *
+ * Civ Rev shows an occasional fully black frame (user: when the 3D
+ * characters change, e.g. after beating barbarians). It is one frame in
+ * hundreds, so an F9 capture never lands on it. Every present copies three
+ * rows (1/4, 1/2, 3/4 height) of the presented surface into a readback
+ * buffer; the next present, after its flush has retired that copy, reads
+ * them. A black frame after a non-black one logs [black-frame] with what was
+ * drawn into which surface since the previous present, and the end of a run
+ * of black frames logs its length. Two slots: with async present one frame
+ * may still be in flight, never two. */
+#define LD_BLACK_ROWS     3u
+#define LD_BLACK_ROWBYTES 32768u   /* 4096 px * 8 B, 512-aligned */
+typedef struct {
+    int valid, fp16;
+    u32 w, frame, buffer_id, target, offset, packets;
+    u32 draw_gen, clear_gen;
+    u32 tdraws[MAX_SURFACES];
+} ld_black_slot;
+static int            g_ld_black_on = -1;
+static ID3D12Resource* g_ld_black_rb = NULL;
+static ld_black_slot  g_ld_black_slots[2];
+static u32            g_ld_black_n = 0;
+/* A black frame that drew a real scene asks the F9 capture to fire by itself
+ * (the black run lasts ~10 frames, so the capture lands inside it). At most
+ * LD_BLACK_CAPTURES (default 2; 0 = never). */
+static int            g_ld_black_cap_req = 0;
+
+static void ld_black_dbg_sample(const surface_t* s, u32 target, u32 buffer_id)
+{
+    if (g_ld_black_on < 0) g_ld_black_on = getenv("LD_BLACK_DBG") ? 1 : 0;
+    if (!g_ld_black_on) { memset(g_ld_frame_tdraws, 0, sizeof g_ld_frame_tdraws); return; }
+    ld_black_slot* sl = &g_ld_black_slots[g_ld_black_n & 1u];
+    sl->valid = 0;
+    if (!g_ld_black_rb) {
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd = {0};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = 2ull * LD_BLACK_ROWS * LD_BLACK_ROWBYTES;
+        bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&g_ld_black_rb))) {
+            g_ld_black_rb = NULL; g_ld_black_on = 0;
+            fprintf(stderr, "[black-frame] readback buffer failed; detector off\n");
+            return;
+        }
+        fprintf(stderr, "[black-frame] detector on (LD_BLACK_DBG)\n");
+    }
+    const int fp16 = s->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const int ok_fmt = fp16 || s->fmt == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                       s->fmt == DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (s->tex && ok_fmt && s->w && s->h >= 4 && s->w * (fp16 ? 8u : 4u) <= LD_BLACK_ROWBYTES) {
+        for (u32 r = 0; r < LD_BLACK_ROWS; r++) {
+            D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+            src.pResource = s->tex; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.pResource = g_ld_black_rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Offset = ((u64)(g_ld_black_n & 1u) * LD_BLACK_ROWS + r) * LD_BLACK_ROWBYTES;
+            dst.PlacedFootprint.Footprint.Format = s->fmt;
+            dst.PlacedFootprint.Footprint.Width = s->w;
+            dst.PlacedFootprint.Footprint.Height = 1;
+            dst.PlacedFootprint.Footprint.Depth = 1;
+            dst.PlacedFootprint.Footprint.RowPitch = LD_BLACK_ROWBYTES;
+            const u32 y = s->h * (r + 1) / 4;
+            D3D12_BOX box = { 0, y, 0, s->w, y + 1, 1 };
+            g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &box);
+        }
+        sl->valid = 1; sl->fp16 = fp16; sl->w = s->w;
+        sl->frame = g_ld_frames; sl->buffer_id = buffer_id; sl->target = target;
+        sl->offset = s->offset; sl->packets = g_ld_last_frame_draws;
+        sl->draw_gen = s->last_draw_generation; sl->clear_gen = s->last_clear_generation;
+        memcpy(sl->tdraws, g_ld_frame_tdraws, sizeof sl->tdraws);
+    }
+    memset(g_ld_frame_tdraws, 0, sizeof g_ld_frame_tdraws);
+    g_ld_black_n++;
+}
+
+/* After this present's flush: the previous present's rows are on the CPU. */
+static void ld_black_dbg_check(void)
+{
+    if (g_ld_black_on <= 0 || !g_ld_black_rb || g_ld_black_n < 2) return;
+    ld_black_slot* sl = &g_ld_black_slots[(g_ld_black_n - 2) & 1u];
+    if (!sl->valid) return;
+    sl->valid = 0;
+    const u64 base = (u64)((g_ld_black_n - 2) & 1u) * LD_BLACK_ROWS * LD_BLACK_ROWBYTES;
+    u8* px = NULL;
+    D3D12_RANGE rr = { (SIZE_T)base, (SIZE_T)(base + LD_BLACK_ROWS * LD_BLACK_ROWBYTES) };
+    if (FAILED(g_ld_black_rb->lpVtbl->Map(g_ld_black_rb, 0, &rr, (void**)&px))) return;
+    u32 maxc = 0; u64 sum = 0;
+    const u32 texel = sl->fp16 ? 8u : 4u;
+    for (u32 r = 0; r < LD_BLACK_ROWS; r++)
+        for (u32 x = 0; x < sl->w; x++) {
+            u8 rgb[3];
+            ld_dump_texel_rgb(px + base + (u64)r * LD_BLACK_ROWBYTES + (u64)x * texel, sl->fp16, rgb);
+            for (int c = 0; c < 3; c++) { if (rgb[c] > maxc) maxc = rgb[c]; sum += rgb[c]; }
+        }
+    D3D12_RANGE wr = {0, 0};
+    g_ld_black_rb->lpVtbl->Unmap(g_ld_black_rb, 0, &wr);
+    const int black = maxc <= 4;
+    static int run = 0; static u32 logged = 0;
+    if (black) {
+        if (run == 0) {
+            u32 scene = 0;
+            for (u32 i = 0; i < MAX_SURFACES; i++) scene += sl->tdraws[i];
+            static int caps_left = -1;
+            if (caps_left < 0) { const char* e = getenv("LD_BLACK_CAPTURES");
+                                 caps_left = e ? atoi(e) : 2; }
+            if (scene >= 50 && caps_left > 0) { caps_left--; g_ld_black_cap_req = 1; }
+        }
+        if (run == 0 && logged < 200) {
+            logged++;
+            fprintf(stderr, "[black-frame] frame=%u flip_buf=%u target=%u 0x%X packets=%u "
+                            "draw_gen=%u clear_gen=%u draws/surface:",
+                    sl->frame, sl->buffer_id, sl->target, sl->offset, sl->packets,
+                    sl->draw_gen, sl->clear_gen);
+            for (u32 i = 0; i < MAX_SURFACES && i < g.n_surfaces; i++)
+                if (sl->tdraws[i])
+                    fprintf(stderr, " %u:0x%X(%ux%u fmt%d)=%u", i, g.surfaces[i].offset,
+                            g.surfaces[i].w, g.surfaces[i].h, (int)g.surfaces[i].fmt, sl->tdraws[i]);
+            fprintf(stderr, "\n");
+        }
+        run++;
+    } else if (run) {
+        if (logged < 400) {
+            logged++;
+            fprintf(stderr, "[black-frame] run ended after %d black frame(s) at frame %u (max=%u avg=%.1f)\n",
+                    run, sl->frame, maxc, (double)sum / (3.0 * LD_BLACK_ROWS * sl->w));
+        }
+        run = 0;
+    }
+}
+
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -10360,7 +10520,18 @@ void rsx_live_draw_present(u32 buffer_id)
           static unsigned long long n = 0, blank = 0;
           n++;
           if (presented_surface->last_draw_generation <
-              presented_surface->last_clear_generation) blank++;
+              presented_surface->last_clear_generation) {
+              blank++;
+              if (blank <= 64)
+                  fprintf(stderr,
+                          "[present-blank] frame=%u flip_buf=%u target=%u 0x%X "
+                          "draw_gen=%u clear_gen=%u last_frame_draws=%u\n",
+                          g_ld_frames, buffer_id, target,
+                          presented_surface->offset,
+                          presented_surface->last_draw_generation,
+                          presented_surface->last_clear_generation,
+                          g_ld_last_frame_draws);
+          }
           if ((n % 256) == 0)
               /* Also say WHICH surface. Surfaces are now keyed on size as well
                * as offset, so several exist at once and "we present the wrong
@@ -10433,6 +10604,7 @@ void rsx_live_draw_present(u32 buffer_id)
     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
 
     g.list->lpVtbl->CopyResource(g.list, bb, srcimg);
+    ld_black_dbg_sample(presented_surface, target, buffer_id);
 
     bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -10442,6 +10614,7 @@ void rsx_live_draw_present(u32 buffer_id)
 
     if (g_ld_movie_mode) ld_flush(LD_FLUSH_PRESENT);
     else                 ld_flush_present_async();
+    ld_black_dbg_check();
     {
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
         if (SUCCEEDED(present_hr))
@@ -10501,11 +10674,13 @@ void rsx_live_draw_present(u32 buffer_id)
                            const char* ep = getenv("LD_CAPTURE_PRESENTS");
                            if (ep && atoi(ep) > 0) s_cap_presents = (u32)atoi(ep); }
         const int down = enabled && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-        if (down && !was_down && !s_cap_file) {
+        const int autoreq = enabled && g_ld_black_cap_req && !s_cap_file;
+        if (autoreq) g_ld_black_cap_req = 0;
+        if (((down && !was_down) || autoreq) && !s_cap_file) {
             DWORD pid = 0;
             HWND fg = GetForegroundWindow();
             if (fg) GetWindowThreadProcessId(fg, &pid);
-            if (pid == GetCurrentProcessId()) {
+            if (autoreq || pid == GetCurrentProcessId()) {
                 char exe[MAX_PATH];
                 DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
                 while (n && exe[n - 1] != 92 && exe[n - 1] != '/') n--;
@@ -10529,7 +10704,8 @@ void rsx_live_draw_present(u32 buffer_id)
                     s_cap_last_ct = 0xFFFFFFFFu;
                     s_cap_nshaders = 0;
                     fprintf(s_cap_file, "# capture frame=%u every=%u\n", s_cap_frame, s_cap_every);
-                    fprintf(stderr, "[capture] F9: capturing frame %u into %s\n", s_cap_frame, s_cap_dir);
+                    fprintf(stderr, "[capture] %s: capturing frame %u into %s\n",
+                            autoreq ? "black-frame auto" : "F9", s_cap_frame, s_cap_dir);
                     fflush(stderr);
                 }
             }
