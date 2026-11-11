@@ -271,6 +271,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint6
                                    uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
+extern "C" void cellGcm_flip_presented(void);
 extern "C" int  cellGcm_take_flip_pending(void);  /* hoisted to file scope: clang-cl rejects block-scope extern "C" */
 
 static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
@@ -508,6 +509,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                 if (rsx_ok && cellGcm_take_flip_pending()) {
                     present_guest_frame();
                     last_flip = cellGcm_flip_request_count();
+                    cellGcm_flip_presented();
                 }
             }
             /* Drain the game's GCM FIFO every tick -- this writes the RSX sync-fence
@@ -527,8 +529,16 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             if (cellGcm_take_flip_pending()) {
                 present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
+                cellGcm_flip_presented();
             }
             cellGcm_rsx_process_fifo();
+            /* The drain stops at a flip, holding exactly that frame: show it
+             * now rather than after the next kick wait (up to 4 ms later). */
+            if (cellGcm_take_flip_pending()) {
+                present_guest_frame();
+                last_flip = cellGcm_flip_request_count();
+                cellGcm_flip_presented();
+            }
         }
         /* YDKJ_INJECT_Q3: the main thread polls q3 (load/state-complete) each frame but
          * it's never posted (producer signals a condvar, never enqueues). Inject a q3

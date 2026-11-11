@@ -1033,6 +1033,21 @@ void cellGcmTickFlip(void)
     if (waiting) GCM_PENDING_SET(2);
 }
 
+/* The present thread has just shown a flipped frame. With CELL_GCM_DISPLAY_HSYNC
+ * the RSX flips as soon as it reaches the flip, without waiting for a vblank,
+ * so complete it now instead of on the next 60 Hz beat. Civilization
+ * Revolution's vblank handler asks for HSYNC on every vblank and its frame
+ * pacer waits for the previous flip to be done; completing on the beat added
+ * up to a whole beat to every frame, so a 17 ms frame took 32 ms (30-40 FPS).
+ * GCM_FLIP_IMMEDIATE=0: always wait for the beat (old); =2: also for VSYNC. */
+void cellGcm_flip_presented(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_FLIP_IMMEDIATE"); v = e ? atoi(e) : 1; }
+    if (v >= 2 || (v == 1 && s_flip_mode == CELL_GCM_DISPLAY_HSYNC))
+        cellGcmTickFlip();
+}
+
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
  * (boot_main vblank_ticker). Not yet active: s_control.put stays 0 because
  * cellGcmGetControlRegister returns a HOST pointer, so the title's put writes
