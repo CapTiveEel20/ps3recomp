@@ -1640,7 +1640,9 @@ s32 cellSaveDataDelete2(u32 container)
 
     int def = 0;
     for (;;) {
-        const int c = savedata_host_pick(L"Delete save", L"Choose the saved game to delete.", labels, n, def);
+        /* No prompt: the caption says it, and the list keeps the same
+         * layout as the Load/Save pickers (a prompt shrinks it). */
+        const int c = savedata_host_pick(L"Delete save", NULL, labels, n, def);
         if (c < 0) {
             printf("[cellSaveData] Delete2: user cancelled%c", 10);
             return CELL_SAVEDATA_RET_CANCEL;
