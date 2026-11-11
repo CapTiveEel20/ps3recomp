@@ -1518,6 +1518,32 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
     return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
 }
 
+/* Folders the title reads/writes by name through the Auto API: its own
+ * settings/profile data (Civilization Revolution's BLES00238-CONFIG = "game
+ * options"). Its List pickers never show them (they ask for a narrower
+ * prefix), so the Delete2 picker leaves them out too. */
+enum { SAVEDATA_AUTO_DIRS_MAX = 8 };
+static char s_auto_dirs[SAVEDATA_AUTO_DIRS_MAX][CELL_SAVEDATA_DIRNAME_SIZE];
+
+static void savedata_note_auto_dir(const char* dirName)
+{
+    if (!dirName || !dirName[0]) return;
+    for (int i = 0; i < SAVEDATA_AUTO_DIRS_MAX; i++) {
+        if (!strcmp(s_auto_dirs[i], dirName)) return;
+        if (!s_auto_dirs[i][0]) {
+            strncpy(s_auto_dirs[i], dirName, CELL_SAVEDATA_DIRNAME_SIZE - 1);
+            return;
+        }
+    }
+}
+
+static int savedata_is_auto_dir(const char* dirName)
+{
+    for (int i = 0; i < SAVEDATA_AUTO_DIRS_MAX && s_auto_dirs[i][0]; i++)
+        if (!strcmp(s_auto_dirs[i], dirName)) return 1;
+    return 0;
+}
+
 s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
                            u32 errDialog,
                            CellSaveDataSetBuf* setBuf,
@@ -1561,6 +1587,7 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
 
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
+    savedata_note_auto_dir(dirName);
 
     /* funcStat is the GAME's guest-OPD address. Marshal StatGet/Set/CB
      * into guest BE memory and dispatch through g_ps3_guest_caller.
@@ -1631,7 +1658,15 @@ s32 cellSaveDataDelete2(u32 container)
     static CellSaveDataDirList dirs[MAXD];
     static wchar_t labels[MAXD][160];
     u32 total = enumerate_save_dirs(tid, dirs, MAXD);
-    int n = (int)(total < MAXD ? total : MAXD);
+    int found = (int)(total < MAXD ? total : MAXD), n = 0;
+    for (int i = 0; i < found; i++) {
+        if (savedata_is_auto_dir(dirs[i].dirName)) {
+            printf("[cellSaveData] Delete2: hiding '%s' (title's own Auto save)%c", dirs[i].dirName, 10);
+            continue;
+        }
+        if (n != i) dirs[n] = dirs[i];
+        n++;
+    }
     if (n == 0) {
         printf("[cellSaveData] Delete2: no saves for '%s'%c", tid, 10);
         return CELL_OK;
@@ -1736,6 +1771,7 @@ s32 cellSaveDataAutoSave(u32 version, const char* dirName,
            version, dirName ? dirName : "<null>");
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
+    savedata_note_auto_dir(dirName);
 
     /* This used to return CELL_OK WITHOUT running funcStat -- the game believed
      * its profile saved while nothing happened (silent data loss). Run the
@@ -1771,6 +1807,7 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
            version, dirName ? dirName : "<null>");
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
+    savedata_note_auto_dir(dirName);
 
     char save_path[1024];
     build_save_path(save_path, sizeof(save_path), dirName);
