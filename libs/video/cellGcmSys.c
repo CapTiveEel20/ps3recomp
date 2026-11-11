@@ -1719,6 +1719,22 @@ static u32 s_tr_off[GCM_TRACE_N], s_tr_w[GCM_TRACE_N];
 static u32 s_cf_off[8], s_cf_w[8], s_cf_i;   /* last JUMP/CALL words, for GCM_CIRCLE_DUMP */
 static u32 s_tr_i = 0;
 
+/* Ring events for the bad-branch report: every `put` the walker sees change
+ * ('P'), and the buffer-full callback's start/end ('R'/'r'). A walker that
+ * reads garbage is either ahead of the title's writes or behind a title that
+ * already reused the memory; the order of these events says which. */
+#define GCM_EV_N 128
+static struct { unsigned long long ms; u32 a, b, get; char tag; } s_ev[GCM_EV_N];
+static volatile long s_ev_i = 0;
+static void gcm_ev(char tag, u32 a, u32 b)
+{
+    extern unsigned long long ps3_ms_now(void);
+    const long i = InterlockedIncrement(&s_ev_i) - 1;
+    const int k = (int)(i % GCM_EV_N);
+    s_ev[k].ms = ps3_ms_now(); s_ev[k].a = a; s_ev[k].b = b;
+    s_ev[k].get = s_fifo_getoff; s_ev[k].tag = tag;
+}
+
 /* A branch we cannot take leaves the walker pointing at whatever it
  * mis-decoded, and it never recovers -- get freezes for the rest of the
  * run and nothing renders. Resynchronise to `put` instead, the same trade
@@ -1926,6 +1942,51 @@ static void gcm_fifo_dump_around(u32 getoff)
         fprintf(stderr, "[FIFODUMP] %+3d io=%08X w=%08X%s\n",
                 k, io, vm_read32(ea), k ? "" : "   <-- bad word");
     }
+}
+
+/* Bad-branch report ([FIFOWHY], first 2 only): ring geometry, the recent
+ * put/recycle events, and the walked words re-read now and 30 ms later. A word
+ * that reads differently later was written AFTER the walker passed it (walker
+ * ran ahead of the title's writes); unchanged garbage means the title reused
+ * the memory before the walker reached it. */
+static void gcm_fifo_freeze_report(u32 getoff, u32 put)
+{
+    static int d = 0;
+    if (!PS3_LOG_FIRST(d, 2)) return;
+    extern unsigned long long ps3_ms_now(void);
+    const unsigned long long now = ps3_ms_now();
+    u32 ctx = s_gcm_ctx_out_ea ? vm_read32(s_gcm_ctx_out_ea) : 0;
+    fprintf(stderr, "[FIFOWHY] get=%08X put=%08X ref=%08X ctx=%08X (ours %08X) "
+            "begin=%08X end=%08X current=%08X (io cur=%08X) recycle_waiting=%d back_jumps=%u\n",
+            getoff, put, vm_read32(GCM_CONTROL_GUEST_ADDR + 8), ctx, s_gcm_context_ea,
+            ctx ? vm_read32(ctx + 0x0) : 0, ctx ? vm_read32(ctx + 0x4) : 0,
+            ctx ? vm_read32(ctx + 0x8) : 0, ctx ? gcm_ea2io(vm_read32(ctx + 0x8)) : 0,
+            s_fifo_recycle_waiting, s_fifo_back_jumps);
+    const long n_ev = s_ev_i;
+    for (long i = n_ev > GCM_EV_N ? n_ev - GCM_EV_N : 0; i < n_ev; i++) {
+        const int k = (int)(i % GCM_EV_N);
+        fprintf(stderr, "[FIFOWHY] ev -%5llu ms %c a=%08X b=%08X get=%08X\n",
+                now - s_ev[k].ms, s_ev[k].tag, s_ev[k].a, s_ev[k].b, s_ev[k].get);
+    }
+    for (u32 t = 1; t <= 8; t++) { const u32 q = (s_cf_i - t) % 8;
+        fprintf(stderr, "[FIFOWHY] branch -%u: w=%08X at io=%08X\n", t, s_cf_w[q], s_cf_off[q]); }
+    for (int i = 0; i < GCM_SPU_BLK_N; i++) if (s_spu_blk[i].io_end)
+        fprintf(stderr, "[FIFOWHY] spu block io %08X..%08X\n", s_spu_blk[i].io_start, s_spu_blk[i].io_end);
+    u32 off[GCM_TRACE_N], seen[GCM_TRACE_N], now0[GCM_TRACE_N];
+    for (u32 t = 0; t < GCM_TRACE_N; t++) {
+        const u32 k = (s_tr_i + t) % GCM_TRACE_N;
+        const u32 ea = gcm_io2ea(s_tr_off[k]);
+        off[t] = s_tr_off[k]; seen[t] = s_tr_w[k]; now0[t] = ea ? vm_read32(ea) : 0xDEADDEADu;
+    }
+    Sleep(30);
+    for (u32 t = 0; t < GCM_TRACE_N; t++) {
+        const u32 ea = gcm_io2ea(off[t]);
+        const u32 later = ea ? vm_read32(ea) : 0xDEADDEADu;
+        fprintf(stderr, "[FIFOWHY] walk io=%08X read=%08X now=%08X +30ms=%08X%s\n",
+                off[t], seen[t], now0[t], later,
+                (seen[t] != now0[t] || seen[t] != later) ? "   <-- CHANGED" : "");
+    }
+    fflush(stderr);
 }
 
 
@@ -2367,6 +2428,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * then runs off the end of the previous frame's bytes until it meets a
      * word that is not a command, and parks there forever. */
     atomic_thread_fence(memory_order_acquire);
+    { static u32 s_ev_last_put = 0xFFFFFFFFu;
+      if (put != s_ev_last_put) { s_ev_last_put = put; gcm_ev('P', put, 0); } }
 
     /* GCM_CTXDBG=1: which context the title is actually driving. Ours is written
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
@@ -2607,7 +2670,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, jump_tgt, put); }
             { u32 tgt = jump_tgt;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_freeze_report(s_fifo_getoff, put); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
                * catches up, and overwrites it when the next segment is
@@ -2667,7 +2730,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_freeze_report(s_fifo_getoff, put); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
@@ -3036,6 +3099,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
           s_sema_blocked_pass = 0; s_park_pass = 0; s_report_hold_pass = 0; }
       else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
+                             gcm_fifo_freeze_report(s_fifo_getoff, put);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
 
@@ -3252,6 +3316,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * for the guest to write from begin (that region was consumed long ago). */
     u32 io_begin = gcm_ea2io(begin);
     const u32 back_jumps0 = s_fifo_back_jumps;
+    gcm_ev('R', gcm_ea2io(current), io_begin);
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
         /* The jump has to be in guest memory before `put` moves behind the
@@ -3296,6 +3361,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
     s_fifo_recycle_waiting = 0;                          /* current no longer reads end */
+    gcm_ev('r', (u32)spins, s_fifo_back_jumps - back_jumps0);
 
     if (s_recdbg)
         fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
@@ -3486,8 +3552,20 @@ s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); 
  * at ctx->current instead; the drain stops at it and fires the flip there,
  * exactly as it does for the 0xFEAD words a statically-linked libgcm emits.
  * Returns 0 when there is no room or ctx is not a mapped command buffer. */
-static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+/* GCM_FLIP_WRAP_NOWAIT=1: the old flip wrap, which rewound `current` without
+ * waiting for the walker (A/B switch for the wait below). */
+static int gcm_flip_wrap_nowait(void)
 {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_FLIP_WRAP_NOWAIT"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+
+/* *wrap is set when the ring must wrap through cellGcm_fifo_recycle; the
+ * caller does that AFTER gcm_flip_request (see _cellGcmSetFlipCommand). */
+static int gcm_flip_into_fifo_ex(u32 ctx, u32 bufferId, int* wrap)
+{
+    *wrap = 0;
     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
         !s_display_buffer_set[bufferId]) return 0;
     /* Never near the end: those bytes are the title's reserve before its
@@ -3518,12 +3596,32 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
     if (runtime_ring && !s_seg_size && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
-        vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
-        vm_write32(ctx + 8, begin);
+        /* Wrap through the buffer-full path, which waits for the walker to
+         * take the JUMP. Rewinding `current` without that wait let the title
+         * write its next frame from `begin` while the walker was still inside
+         * the ring: Civilization Revolution's frames are up to ~1.9 MB of a
+         * 2 MB ring, so with one frame in flight it lapped the walker,
+         * overwrote commands it had not read yet, and the walker decoded
+         * vertex data as a JUMP/CALL and lost the flip (game froze). */
+        vm_write32(ctx + 8, cur + 4);
+        if (!gcm_flip_wrap_nowait()) *wrap = 1;
+        else { vm_write32(cur + 4, 0x20000000u | io_begin); vm_write32(ctx + 8, begin); }
         return 1;
     }
     vm_write32(ctx + 8, cur + 4);
     return 1;
+}
+
+/* The wait lets the walker run through the marker. Registered after the flip
+ * request, or the walker can execute the flip first: the tick then completes
+ * the PREVIOUS request, gcm_flip_request sets WAITING afterwards, and the
+ * title's wait-for-flip never ends (Civ Rev froze in its frame pacer). */
+static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+{
+    int wrap = 0;
+    const int r = gcm_flip_into_fifo_ex(ctx, bufferId, &wrap);
+    if (wrap) cellGcm_fifo_recycle(ctx);
+    return r;
 }
 
 /* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
@@ -3708,6 +3806,21 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     if (page < 65536 && s_io_address_table[page] != 0xFFFF) {
         u32 io_page = s_io_address_table[page];
         vm_write32(off_ea, (io_page << 20) | (address & 0xFFFFF));
+        /* [FIFOWHY] 'A'/'L': a conversion of an address inside the command
+         * ring is how libgcm's flush computes `put`. Record the result and
+         * who asked (guest lr + two back-chain return addresses). */
+        if (s_gcm_ctx_out_ea) {
+            extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+            const u32 c = vm_read32(s_gcm_ctx_out_ea);
+            const u32 rb = c ? vm_read32(c + 0x0) : 0, re = c ? vm_read32(c + 0x4) : 0;
+            if (c && address >= rb && address <= re + 4u && g_active_ctx) {
+                const u32 sp = (u32)g_active_ctx->gpr[1];
+                const u32 b1 = sp ? vm_read32(sp + 4) : 0;
+                const u32 b2 = b1 ? vm_read32(b1 + 4) : 0;
+                gcm_ev('A', (io_page << 20) | (address & 0xFFFFF), (u32)g_active_ctx->lr);
+                gcm_ev('L', b1 ? vm_read32(b1 + 0x14) : 0, b2 ? vm_read32(b2 + 0x14) : 0);
+            }
+        }
         return CELL_OK;
     }
 
@@ -4338,8 +4451,12 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
 /* NID: 0x21397818 */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
-    if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
-        return gcm_flip_request(bufferId, 1);
+    int wrap = 0;
+    if (gcm_flip_into_fifo_ex((u32)(uintptr_t)ctx, bufferId, &wrap)) {
+        const s32 rc = gcm_flip_request(bufferId, 1);
+        if (wrap) cellGcm_fifo_recycle((u32)(uintptr_t)ctx);
+        return rc;
+    }
     return cellGcmSetFlipCommand(bufferId);
 }
 
@@ -4366,8 +4483,12 @@ s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
             vm_write32(cur + 8,  0x00040068u);   /* SEMAPHORE_ACQUIRE */
             vm_write32(cur + 12, labelValue);
             vm_write32(c + 8, cur + 16);
-            if (gcm_flip_into_fifo(c, bufferId))
-                return gcm_flip_request(bufferId, 1);
+            int wrap = 0;
+            if (gcm_flip_into_fifo_ex(c, bufferId, &wrap)) {
+                const s32 rc = gcm_flip_request(bufferId, 1);
+                if (wrap) cellGcm_fifo_recycle(c);
+                return rc;
+            }
             vm_write32(c + 8, cur);              /* no room for the flip */
         }
     }
