@@ -633,6 +633,17 @@ static void dump_threads(const char* label, HMODULE self)
       if (!any) dbg_printf("[WATCHDOG] no guest thread is inside an HLE\n"); }
     dbg_printf("[WATCHDOG] guest threads, by guest lr:\n");
     ppu_report_guest_lrs();
+    /* The boot module's extent, read from its PE header BEFORE any thread is
+     * suspended. GetModuleHandleEx / GetModuleFileName take the loader lock,
+     * and a suspended thread can be holding it (any thread starting or
+     * exiting does -- Civilization Revolution creates one per SPU task), so
+     * calling them while a thread is suspended froze the game for good on an
+     * F11 dump. While a thread is suspended only address arithmetic happens. */
+    const uint64_t self_lo = (uint64_t)self;
+    uint64_t self_hi = self_lo;
+    { const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)self;
+      const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)((const char*)self + dos->e_lfanew);
+      self_hi = self_lo + nt->OptionalHeader.SizeOfImage; }
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;
@@ -645,21 +656,14 @@ static void dump_threads(const char* label, HMODULE self)
             s_dbg_capn = 0; s_dbg_capbuf[0] = 0; s_dbg_cap = s_dbg_capbuf;
             SuspendThread(th);
             CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL;
+            uint64_t outside_rip = 0;   /* named after ResumeThread (loader lock) */
             if (GetThreadContext(th, &ctx)) {
-                HMODULE m = NULL;
-                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCSTR)ctx.Rip, &m);
-                if (m == self) {
+                if (ctx.Rip >= self_lo && ctx.Rip < self_hi) {
                     dbg_printf( "[WATCHDOG]   tid %5lu BOOT rip rva=0x%llX\n",
                             (unsigned long)te.th32ThreadID,
                             (unsigned long long)((char*)ctx.Rip - (char*)self));
                 } else {
-                    char path[MAX_PATH] = "?";
-                    if (m) GetModuleFileNameA(m, path, sizeof path);
-                    const char* base = strrchr(path, '\\');
-                    dbg_printf( "[WATCHDOG]   tid %5lu in %s\n",
-                            (unsigned long)te.th32ThreadID, base ? base + 1 : path);
+                    outside_rip = ctx.Rip ? ctx.Rip : 1;
                 }
                 /* Scan the suspended thread's stack for boot-module return
                  * addresses to reconstruct the lifted call chain — done for ALL
@@ -687,12 +691,7 @@ static void dump_threads(const char* label, HMODULE self)
                     int found = 0;
                     for (int k = 0; k < maxk && found < 40; k++) {
                         uint64_t v = sp[k];
-                        if (v < (uint64_t)self) continue;
-                        HMODULE mm = NULL;
-                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                           (LPCSTR)v, &mm);
-                        if (mm == self) {
+                        if (v >= self_lo && v < self_hi) {
                             /* Resolve to the guest function containing this return
                              * address: the function_table entry with the largest host
                              * pointer <= it. A raw RVA needs symbols a release build
@@ -731,6 +730,17 @@ static void dump_threads(const char* label, HMODULE self)
             }
             ResumeThread(th);
             s_dbg_cap = NULL;
+            if (outside_rip) {
+                HMODULE m = NULL;
+                char path[MAX_PATH] = "?";
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       (LPCSTR)outside_rip, &m) && m)
+                    GetModuleFileNameA(m, path, sizeof path);
+                const char* base = strrchr(path, '\\');
+                dbg_printf( "[WATCHDOG]   tid %5lu in %s\n",
+                        (unsigned long)te.th32ThreadID, base ? base + 1 : path);
+            }
             if (s_dbg_capn) dbg_printf("%s", s_dbg_capbuf);
             CloseHandle(th);
         } while (Thread32Next(snap, &te));
