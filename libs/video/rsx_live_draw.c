@@ -71,6 +71,7 @@ void rsx_live_draw_shutdown(void) {}
 
 #include "rsx_dispatch.h"
 #include "rsx_fp_decompiler.h"
+#include "rsx_texture_layout.h"
 static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_surf = 0;
 /* Set once PS1 VRAM actually holds a drawn frame (see the PS1_PC heartbeat).
  * Every surface dump before this is an early-boot snapshot of a framebuffer the
@@ -2122,6 +2123,80 @@ static ID3D12Resource* create_texture_rgba(const u8* rgba, u32 w, u32 h)
     return create_texture_mipped(DXGI_FORMAT_R8G8B8A8_UNORM, &lv, 1);
 }
 
+/* Bytes from one cube face to the next in guest memory. RSX stores each face
+ * as its own COMPLETE mip pyramid (SET_TEXTURE_FORMAT's level count, down to
+ * what the size allows) padded to 128 bytes -- rsx_texture_cube_face_stride,
+ * which rsx_draw_engine.c already uses. This file used to take the decoded
+ * span / 6: no padding, and for DXT a level count cut off at 4x4, so faces
+ * 1..5 were read from inside the previous face. Civilization Revolution lights
+ * every character and unit from five cube maps (irradiance + four gloss
+ * levels), and the misread faces showed as hard-edged red-brown blotches on
+ * skin, speckled cloth and near-black trees. LD_CUBE_OLD_STRIDE=1 restores
+ * the old arithmetic for A/B. */
+static u32 ld_cube_face_stride_old(const rsx_dsp_texture* t, u32 texel_size,
+                                   u32 block_size)
+{
+    u32 n_mips = t->mipmaps ? t->mipmaps : 1;
+    if (n_mips > 14) n_mips = 14;
+    if (block_size) {
+        n_mips = 1;
+        for (u32 d = (t->width < t->height ? t->width : t->height) / 4;
+             d > 1; d >>= 1)
+            n_mips++;
+        if (t->mipmaps && n_mips > t->mipmaps)
+            n_mips = t->mipmaps;
+        if (n_mips > 14) n_mips = 14;
+    }
+    u32 mw = t->width, mh = t->height, span = 0;
+    for (u32 m = 0; m < n_mips; m++) {
+        span += block_size ? ((mw + 3) / 4) * block_size * ((mh + 3) / 4)
+                           : mw * texel_size * mh;
+        if (mw == 1 && mh == 1) break;
+        mw = mw > 1 ? mw >> 1 : 1;
+        mh = mh > 1 ? mh >> 1 : 1;
+    }
+    return span;
+}
+
+static u32 ld_cube_face_stride(const rsx_dsp_texture* t)
+{
+    const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    const int linear = (t->format & TEX_FMT_LINEAR) != 0;
+    u32 texel_size = 0, block_size = 0;
+    switch (base_fmt) {
+    case TEX_FMT_DXT1:  block_size = 8; break;
+    case TEX_FMT_DXT23:
+    case TEX_FMT_DXT45: block_size = 16; break;
+    case TEX_FMT_B8: texel_size = 1; break;
+    case TEX_FMT_A4R4G4B4:
+    case TEX_FMT_A1R5G5B5:
+    case TEX_FMT_R5G6B5:
+    case TEX_FMT_G8B8: texel_size = 2; break;
+    case RSX_TEX_FMT_W16Z16Y16X16_FLOAT: texel_size = 8; break;
+    case TEX_FMT_A8R8G8B8:
+    case TEX_FMT_DEPTH24_D8: texel_size = 4; break;
+    default: return 0;
+    }
+    static int old = -1;
+    if (old < 0) old = getenv("LD_CUBE_OLD_STRIDE") ? 1 : 0;
+    const u32 before = ld_cube_face_stride_old(t, texel_size, block_size);
+    const u32 stride = old ? before
+        : rsx_texture_cube_face_stride(t->format & 0xFFu, t->width, t->height,
+                                       t->mipmaps, linear ? t->pitch : 0);
+    { static int dbg = -1; static u32 seen[64]; static u32 n_seen = 0;
+      if (dbg < 0) dbg = getenv("LD_TEX_FLAGS_DBG") ? 1 : 0;
+      const u32 sig = (t->format & 0xFF) | (t->width << 8) | (t->mipmaps << 24);
+      u32 k = 0;
+      while (k < n_seen && seen[k] != sig) k++;
+      if (dbg && k == n_seen && n_seen < 64) {
+          seen[n_seen++] = sig;
+          fprintf(stderr, "[cube] fmt=0x%02X %ux%u mips=%u face_stride=%u"
+                          " (old %u)\n", t->format & 0xFF, t->width,
+                  t->height, t->mipmaps, stride, before);
+      } }
+    return stride;
+}
+
 static u32 texture_source_span(const rsx_dsp_texture* t)
 {
     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
@@ -2144,6 +2219,8 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
     if (!t->width || !t->height || t->width > 4096 || t->height > 4096 ||
         t->dimension != 2)
         return 0;
+    if (t->cubemap)
+        return ld_cube_face_stride(t) * 6u;
     u32 n_mips = t->mipmaps ? t->mipmaps : 1;
     if (n_mips > 14) n_mips = 14;
     /* A pitch-linear (LN) texture cannot carry a mip chain -- the RSX samples
@@ -2273,7 +2350,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
             if (t->mipmaps && n_mips > t->mipmaps)
                 n_mips = t->mipmaps;
             if (n_mips > 14) n_mips = 14;
-            const u32 face_span = total / 6;
+            const u32 face_span = ld_cube_face_stride(t);
             tex_level_t cube_levels[6 * 14];
             u32 level = 0;
             for (u32 face = 0; face < 6; face++) {
@@ -2336,7 +2413,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
             mh = mh > 1 ? mh >> 1 : 1;
         }
         if (n_mips > available_mips) n_mips = available_mips;
-        const u32 face_span = span / 6;
+        const u32 face_span = ld_cube_face_stride(t);
         u8* rgba[6 * 14] = {0};
         tex_level_t cube_levels[6 * 14];
         u32 level = 0;
@@ -4809,6 +4886,82 @@ static ID3D12PipelineState* get_pso(
         if (texture.enabled && texture.cubemap)
             cube_mask |= 1u << unit;
     }
+    /* Per-texture colour space and sign, as rsx_draw_engine.c does it.
+     * SET_TEXTURE_ADDRESS bits 20..23 ask for an sRGB->linear read (gamma)
+     * and bit 12 for UNSIGNED_REMAP_BIASED (every fetch re-centred to -1..1:
+     * how normal maps are stored); SHADER_PACKER (0x1FEC) asks for the
+     * colour export to be re-encoded linear->sRGB. The live renderer used to
+     * drop all three, so normal-mapped models lit with 0..1 normals instead
+     * of -1..1 and gamma-space textures/exports mixed with linear ones.
+     * Only units the program samples count; the masks are baked into the
+     * HLSL, so they are part of the PSO key below. Kill switches for A/B:
+     * LD_TEX_GAMMA=0, LD_TEX_EXPAND=0, LD_SRGB_OUT=0. */
+    static int tex_gamma_on = -1, tex_expand_on = -1, srgb_out_on = -1;
+    if (tex_gamma_on < 0) {
+        const char* e = getenv("LD_TEX_GAMMA");
+        tex_gamma_on = !(e && e[0] == '0');
+        e = getenv("LD_TEX_EXPAND");
+        tex_expand_on = !(e && e[0] == '0');
+        e = getenv("LD_SRGB_OUT");
+        srgb_out_on = !(e && e[0] == '0');
+        fprintf(stderr, "[ld-color] tex_gamma=%d tex_expand=%d srgb_out=%d\n",
+                tex_gamma_on, tex_expand_on, srgb_out_on);
+    }
+    u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
+    u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
+    for (u32 unit = 0; unit < RSX_DSP_NUM_TEXTURES; unit++) {
+        rsx_dsp_texture texture;
+        rsx_dsp_get_texture(&g.rsx, unit, &texture);
+        if (!texture.enabled) continue;
+        if (tex_gamma_on)
+            gamma_masks[unit] = rsx_texture_gamma_mask(
+                texture.format, texture.remap, texture.filter, texture.wrap);
+        if (tex_expand_on)
+            expand_masks[unit] = rsx_texture_expand_mask(
+                texture.format, texture.remap, texture.filter, texture.wrap);
+    }
+    const u32 gamma_units =
+        rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
+    const u32 expand_units =
+        rsx_fp_texture_expand_units(fp_uc, fp_size, expand_masks);
+    for (u32 unit = 0; unit < RSX_DSP_NUM_TEXTURES; unit++) {
+        if (!(gamma_units & (1u << unit))) gamma_masks[unit] = 0;
+        if (!(expand_units & (1u << unit))) expand_masks[unit] = 0;
+    }
+    const u32 srgb_output = srgb_out_on && rsx_fp_srgb_output_enabled(
+        rsx_dsp_reg(&g.rsx, 0x1FECu), fp_ctrl,
+        rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu);
+    /* LD_TEX_FLAGS_DBG=1: each distinct (unit, format, remap, address flags,
+     * filter sign flags, packer) a fragment program samples, once. Answers
+     * "does this game use gamma / biased / signed textures at all?" */
+    { static int dbg = -1; static u32 seen[256]; static u32 n_seen = 0;
+      if (dbg < 0) dbg = getenv("LD_TEX_FLAGS_DBG") ? 1 : 0;
+      if (dbg) {
+          const u32 sampled = rsx_fp_texture_units(fp_uc, fp_size);
+          for (u32 unit = 0; unit < RSX_DSP_NUM_TEXTURES; unit++) {
+              if (!(sampled & (1u << unit))) continue;
+              rsx_dsp_texture t;
+              rsx_dsp_get_texture(&g.rsx, unit, &t);
+              const u32 sig = (unit << 28) ^ ((t.format & 0xFF) << 20) ^
+                  ((t.wrap >> 12) & 0xFFFFF) ^ ((t.filter >> 28) << 16) ^
+                  (t.remap & 0xFFFF) * 31u ^ (rsx_dsp_reg(&g.rsx, 0x1FECu) << 27);
+              u32 k = 0;
+              while (k < n_seen && seen[k] != sig) k++;
+              if (k < n_seen || n_seen >= 256) continue;
+              seen[n_seen++] = sig;
+              fprintf(stderr,
+                      "[tex-flags] u%u fmt=0x%02X remap=0x%04X addr=0x%08X"
+                      " (biased=%u gamma=0x%X signed=0x%X) filter=0x%08X"
+                      " packer=0x%X surf=0x%02X ctrl=0x%X -> gamma=0x%X"
+                      " expand=0x%X srgb_out=%u\n",
+                      unit, t.format & 0xFF, t.remap & 0xFFFF, t.wrap,
+                      (t.wrap >> 12) & 1u, (t.wrap >> 20) & 15u,
+                      (t.wrap >> 28) & 15u, t.filter,
+                      rsx_dsp_reg(&g.rsx, 0x1FECu),
+                      rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu, fp_ctrl,
+                      gamma_masks[unit], expand_masks[unit], srgb_output);
+          }
+      } }
     const u32 vtex_mask = vertex_texture_mask();
     const u32 txl_mask = vp_txl_unit_mask(vp_uc, vp_instrs);
     if (txl_mask && !(txl_mask & vtex_mask)) {
@@ -4860,6 +5013,9 @@ static ID3D12PipelineState* get_pso(
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
+    if (gamma_units) key = fnv1a(gamma_masks, sizeof(gamma_masks), key);
+    if (expand_units) key = fnv1a(expand_masks, sizeof(expand_masks), key);
+    if (srgb_output) key = fnv1a(&srgb_output, sizeof(srgb_output), key);
     /* BRB/CLB outcomes are baked into the program (rsx_vp_set_branch_bits). */
     const int vp_branch_bits_used = rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16);
     const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
@@ -4989,11 +5145,20 @@ static ID3D12PipelineState* get_pso(
     u32 decompiled_constant_count = 0;
     int fi;
     if (ld_fp_constants_buffered()) {
-        fi = rsx_fp_decompile_buffered_ex(
-            fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl,
-            sizeof(ps_hlsl), &decompiled_constant_count);
+        fi = (gamma_units || expand_units)
+            ? rsx_fp_decompile_buffered_shadow_color_expand_ex(
+                fp_uc, fp_size, fp_ctrl, cube_mask, NULL,
+                gamma_units ? gamma_masks : NULL,
+                expand_units ? expand_masks : NULL,
+                ps_hlsl, sizeof(ps_hlsl), &decompiled_constant_count)
+            : rsx_fp_decompile_buffered_ex(
+                fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl,
+                sizeof(ps_hlsl), &decompiled_constant_count);
         if (fi > 0 &&
             decompiled_constant_count != g.fp_constants.count)
+            fi = -1;
+        if (fi > 0 && srgb_output &&
+            rsx_fp_apply_srgb_output(ps_hlsl, sizeof(ps_hlsl)) < 0)
             fi = -1;
         if (fi > 0 && rs.alpha_test_enable &&
             rsx_fp_apply_alpha_test_buffered(
