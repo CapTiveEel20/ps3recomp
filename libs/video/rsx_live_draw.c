@@ -1562,6 +1562,36 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
     sd.MaxLOD = mip_present ? (float)max_lod_fx / 256.0f : 0.0f;
     if (sd.MaxLOD < sd.MinLOD) sd.MaxLOD = sd.MinLOD;
     sd.MaxAnisotropy = 1;
+
+    /* TEXTURE_FILTER [12:0] = LOD bias, signed, x/256 (as rsx_d3d12_backend.c).
+     * LD_LOD_BIAS=0: ignore it (old). */
+    static int use_bias = -1;
+    if (use_bias < 0) { const char* e = getenv("LD_LOD_BIAS"); use_bias = !(e && e[0] == '0'); }
+    if (use_bias) {
+        int bias = (int)(t->filter & 0x1FFFu);
+        if (bias & 0x1000) bias -= 0x2000;
+        sd.MipLODBias = (float)bias / 256.0f;
+    }
+
+    /* Anisotropic filtering: the title's request is TEXTURE_CONTROL0 [6:4]
+     * (1,2,4,6,8,10,12,16x). LD_ANISO=N (default 16) raises it to at least N
+     * for mipmapped textures with linear min and mag filters (world and model
+     * textures; UI, render targets and lookup tables have no mips and keep the
+     * game's filter). LD_ANISO=1: only the game's own request. */
+    static int force_aniso = -1;
+    if (force_aniso < 0) {
+        const char* e = getenv("LD_ANISO");
+        force_aniso = e ? atoi(e) : 16;
+        if (force_aniso < 1) force_aniso = 1;
+        if (force_aniso > 16) force_aniso = 16;
+    }
+    static const u8 aniso_lut[8] = { 1, 2, 4, 6, 8, 10, 12, 16 };
+    u32 aniso = aniso_lut[(t->control0 >> 4) & 7u];
+    if (mip_present && (u32)force_aniso > aniso) aniso = (u32)force_aniso;
+    if (aniso > 1 && min_linear && mag_linear) {
+        sd.Filter = D3D12_FILTER_ANISOTROPIC;
+        sd.MaxAnisotropy = aniso;
+    }
     return sd;
 }
 /* Cache key of a sampler: exactly the fields decode_sampler reads, so two states share a descriptor only when
@@ -1577,7 +1607,10 @@ static u64 sampler_key(const rsx_dsp_texture* t)
     const u64 wrap_w  = (t->wrap >> 16) & 0xF;
     const u64 max_lod = (t->control0 >> 7) & 0xFFF;
     const u64 min_lod = (t->control0 >> 19) & 0xFFF;
-    return minf | (magf << 3) | (wrap_u << 6) | (wrap_v << 10) | (wrap_w << 14) | (max_lod << 18) | (min_lod << 30);
+    const u64 aniso   = (t->control0 >> 4) & 0x7;
+    const u64 bias    = t->filter & 0x1FFF;
+    return minf | (magf << 3) | (wrap_u << 6) | (wrap_v << 10) | (wrap_w << 14) | (max_lod << 18) | (min_lod << 30)
+         | (aniso << 42) | (bias << 45);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1696,9 +1729,16 @@ static u32 sampler_slot(const rsx_dsp_texture* t, u64 key)
 {
     for (u32 i = 0; i < g.n_samplers; i++)
         if (g.smp_keys[i] == key) return 1 + i;
-    if (g.n_samplers >= SMP_CACHE_SLOTS) return SMP_DEFAULT;
+    if (g.n_samplers >= SMP_CACHE_SLOTS) {
+        static int warned;
+        if (!warned) { warned = 1; fprintf(stderr, "[sampler] cache full (%u): new states use the default sampler\n", (unsigned)SMP_CACHE_SLOTS); }
+        return SMP_DEFAULT;
+    }
     D3D12_SAMPLER_DESC sd = decode_sampler(t);
     const u32 slot = 1 + g.n_samplers;
+    fprintf(stderr, "[sampler] #%u filter=%08X ctrl0=%08X -> d3d filter=0x%X aniso=%u bias=%.2f lod=%.2f..%.2f\n",
+            g.n_samplers, t->filter, t->control0, (unsigned)sd.Filter, sd.MaxAnisotropy,
+            sd.MipLODBias, sd.MinLOD, sd.MaxLOD);
     g.dev->lpVtbl->CreateSampler(g.dev, &sd, smp_cpu(slot));
     g.smp_keys[g.n_samplers++] = key;
     return slot;
