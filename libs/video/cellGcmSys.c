@@ -752,7 +752,8 @@ u32 cellGcmGetCurrentField(void)
 /* NID: 0xA53D12AE */
 void cellGcmSetFlipMode(u32 mode)
 {
-    printf("[cellGcmSys] SetFlipMode(mode=%u)\n", mode);
+    if (ps3_log_verbose())   /* some titles call this every frame */
+        printf("[cellGcmSys] SetFlipMode(mode=%u)\n", mode);
     s_flip_mode = mode;
 }
 

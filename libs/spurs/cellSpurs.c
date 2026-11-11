@@ -1254,6 +1254,8 @@ static s32 spurs_create_task(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
+            /* Per task: Civ Rev creates ~6 tasks a frame (see ps3_log.h). */
+            if (ps3_log_verbose())
             printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
                    " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
                    s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
@@ -1393,6 +1395,7 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
       if (s_r8) {
           attr->argument_ea  = (u32)sizeContext;   /* r8 */
           attr->lsPattern_ea = 0;                  /* r9 was a leftover */
+          if (ps3_log_verbose())
           printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
                  attr->argument_ea, (u32)(uintptr_t)argument);
       } }
@@ -1427,6 +1430,7 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
                  d, (u32)attr->eaContext, attr->sizeContext,
                  attr->lsPattern_ea, attr->argument_ea);
       } }
+    if (ps3_log_verbose())
     printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
            (u32)eaElf, (u32)eaContext, sizeContext,
            attr->lsPattern_ea, attr->argument_ea);
