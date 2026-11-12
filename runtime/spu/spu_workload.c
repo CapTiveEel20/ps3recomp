@@ -16,6 +16,7 @@
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
 #ifdef _WIN32
 #include <windows.h>
+#pragma comment(lib, "synchronization.lib")   /* WakeByAddressAll (exit-code containers) */
 #else
 #include <pthread.h>
 #include <errno.h>
@@ -627,6 +628,9 @@ static void spu_task_exit_container_publish(uint32_t taskset_ea, uint32_t task, 
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     c[0] = 0; c[1] = 0; c[2] = 0;
     __atomic_store_n(&c[3], (uint8_t)1, __ATOMIC_RELEASE);
+    /* cellSpursTaskExitCodeGet waits on this byte's address (WaitOnAddress):
+     * wake it now instead of letting it find out on its next poll. */
+    WakeByAddressAll((PVOID)&c[3]);
     { static int _n = 0; if (PS3_LOG_FIRST(_n, 16))
         fprintf(stderr, "[spurs] task %u of taskset 0x%08X exited code=0x%08X -> container 0x%08X\n",
                 task, taskset_ea, code, ea); }

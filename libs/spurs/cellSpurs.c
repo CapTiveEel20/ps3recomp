@@ -37,6 +37,7 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 
 #ifdef _WIN32
 #include <windows.h>
+#pragma comment(lib, "synchronization.lib")   /* WaitOnAddress (TaskExitCodeGet) */
 #else
 #include <pthread.h>
 #include <time.h>
@@ -1623,6 +1624,40 @@ s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* attr,
     return CELL_OK;
 }
 
+/* SPURS_EXIT_WAKE=0: TaskExitCodeGet polls with Sleep(0)/Sleep(1) as before
+ * instead of waiting on the container's address. */
+static int spurs_exit_wake_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPURS_EXIT_WAKE"); v = !(e && *e == '0'); }
+    return v;
+}
+
+/* One stderr line every ~5 s while titles wait on exit codes: how many waits
+ * and how long they took (task run time + wake latency). Not per wait --
+ * a log line costs ~150 us here. */
+static void spurs_exit_wait_stats(long long t0)
+{
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static long long win_start;
+    static unsigned n;
+    static double sum, mx;
+    LARGE_INTEGER now, f;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&f);
+    const double us = (double)(now.QuadPart - t0) * 1e6 / (double)f.QuadPart;
+    AcquireSRWLockExclusive(&lk);
+    if (!win_start) win_start = now.QuadPart;
+    n++; sum += us; if (us > mx) mx = us;
+    const double secs = (double)(now.QuadPart - win_start) / (double)f.QuadPart;
+    if (secs >= 5.0) {
+        fprintf(stderr, "[spurs] exit-code waits: %.0f/s, avg %.0f us, max %.0f us (%s)\n",
+                n / secs, sum / n, mx, spurs_exit_wake_enabled() ? "wake" : "poll");
+        win_start = now.QuadPart; n = 0; sum = 0; mx = 0;
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+
 /* NID: 0x13AE18F3. Wait until the task bound to this container has exited,
  * then store its exit code (s32, big-endian) at *status. Civ Rev's culling
  * waits here for each task's visible-object count and uses it unchecked, so
@@ -1636,17 +1671,47 @@ s32 cellSpursTaskExitCodeGet(CellSpursTaskExitCode* exitCode, s32* status)
     if (ea & 0x7Fu) return (s32)CELL_SPURS_TASK_ERROR_ALIGN;
 
     const uint8_t* c = vm_base + ea;
-    unsigned spins = 0, warned = 0;
-    while (__atomic_load_n(&c[3], __ATOMIC_ACQUIRE) != 1) {
-        /* Tasks finish within a frame: yield first, then sleep 1 ms. */
-        if (++spins < 2000) { Sleep(0); continue; }
-        Sleep(1);
-        if ((spins - 2000) % 2000 == 1999 && warned < 4) {
-            warned++;
-            fprintf(stderr, "[cellSpurs] TaskExitCodeGet(0x%08X): task still running after ~%us\n",
-                    ea, warned * 2);
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
+    if (spurs_exit_wake_enabled()) {
+        /* The SPU side wakes this address the moment it publishes the code
+         * (spu_task_exit_container_publish), so wait on it rather than
+         * poll: the 1 ms Sleep below overshot each wait by up to ~1 ms, and
+         * Civ Rev waits twice a frame (~9% of its main thread in a match).
+         * A short spin first catches a task that is about to finish; the
+         * 2 ms timeout only bounds a missed wake (the container rewritten
+         * by the guest). */
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        const long long spin_until = t0.QuadPart + f.QuadPart / 50000;   /* 20 us */
+        unsigned waits = 0, warned = 0;
+        for (;;) {
+            uint8_t v = __atomic_load_n(&c[3], __ATOMIC_ACQUIRE);
+            if (v == 1) break;
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            if (now.QuadPart < spin_until) { YieldProcessor(); continue; }
+            WaitOnAddress((volatile VOID*)&c[3], &v, 1, 2);
+            if (++waits % 1000 == 0 && warned < 4) {
+                warned++;
+                fprintf(stderr, "[cellSpurs] TaskExitCodeGet(0x%08X): task still running after ~%us\n",
+                        ea, warned * 2);
+            }
+        }
+    } else {
+        unsigned spins = 0, warned = 0;
+        while (__atomic_load_n(&c[3], __ATOMIC_ACQUIRE) != 1) {
+            /* Tasks finish within a frame: yield first, then sleep 1 ms. */
+            if (++spins < 2000) { Sleep(0); continue; }
+            Sleep(1);
+            if ((spins - 2000) % 2000 == 1999 && warned < 4) {
+                warned++;
+                fprintf(stderr, "[cellSpurs] TaskExitCodeGet(0x%08X): task still running after ~%us\n",
+                        ea, warned * 2);
+            }
         }
     }
+    spurs_exit_wait_stats(t0.QuadPart);
     u32 code = ((u32)c[4] << 24) | ((u32)c[5] << 16) | ((u32)c[6] << 8) | (u32)c[7];
     vm_write32(out, code);
     return CELL_OK;
