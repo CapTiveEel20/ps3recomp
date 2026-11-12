@@ -140,6 +140,13 @@ u32 rsx_texture_cube_face_stride(u32 rsx_fmt, u32 w, u32 h, u32 levels,
  * Interleaves the low bits of x and y, then appends whichever axis still has
  * bits left when the other is exhausted (non-square images). */
 u32 rsx_swizzle_offset(u32 x, u32 y, u32 log2w, u32 log2h);
+/* rsx_swizzle_offset for a texel of texel_bytes. The RSX swizzles in 32-bit
+ * units, so an 8-byte texel (W16Z16Y16X16_FLOAT) is two adjacent units,
+ * x' = 2x + half: in texels that interleaves y first. Measured on Civ Rev:
+ * hdr_sunlight_a_envi.dds (FP16 cube) equals the game's swizzled copy only
+ * y-first (mean diff 0 vs 5.19 x-first; x-first transposes every face).
+ * Other sizes: rsx_swizzle_offset. 16-byte texels are not handled. */
+u32 rsx_swizzle_texel_offset(u32 x, u32 y, u32 log2w, u32 log2h, u32 texel_bytes);
 /* The same for a 3D image: x, y and z bits interleave (x first) while all
  * three have bits, then whichever still do (RPCS3 convert_linear_swizzle_3d). */
 u32 rsx_swizzle_offset_3d(u32 x, u32 y, u32 z, u32 log2w, u32 log2h, u32 log2d);
@@ -236,6 +243,12 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4]);
  * Read once and cached. Lives here rather than in each backend so they cannot
  * disagree about it. */
 int rsx_texture_argb_is_rgba(void);
+
+/* Change detector for guest texture bytes (compare only with an earlier
+ * result of this same function). Four independent word-FNV lanes: any single
+ * changed 8-byte word always changes the result, at ~4x the throughput of
+ * one serial FNV chain. Not a content ID and not stable across versions. */
+u64 rsx_mutation_hash(const u8* src, u32 span);
 
 #ifdef __cplusplus
 }

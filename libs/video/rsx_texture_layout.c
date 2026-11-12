@@ -25,6 +25,13 @@ u32 rsx_swizzle_offset(u32 x, u32 y, u32 log2w, u32 log2h)
     return off;
 }
 
+u32 rsx_swizzle_texel_offset(u32 x, u32 y, u32 log2w, u32 log2h, u32 texel_bytes)
+{
+    if (texel_bytes == 8u)
+        return rsx_swizzle_offset(y, x, log2h, log2w);
+    return rsx_swizzle_offset(x, y, log2w, log2h);
+}
+
 u32 rsx_swizzle_offset_3d(u32 x, u32 y, u32 z, u32 log2w, u32 log2h, u32 log2d)
 {
     u32 off = 0, shift = 0;
@@ -457,4 +464,37 @@ u8 rsx_texture_expand_mask(u32 format, u32 control1, u32 filter, u32 address)
     /* Bit 4: 16-bit channels (X16, Y16_X16) re-centre on 32768/32767. */
     if (mask && ((format & 0x9Fu) == 0x94u || (format & 0x9Fu) == 0x95u)) mask |= 0x10u;
     return mask;
+}
+
+/* Each step (h ^ w) * P is a bijection of h (P odd) and of w, so a change in
+ * one word reaches its lane's final value, and the fold below is a bijection
+ * of each lane given the others. */
+u64 rsx_mutation_hash(const u8* src, u32 span)
+{
+    const u64 P = 1099511628211ull;
+    u64 h0 = 1469598103934665603ull, h1 = h0 ^ 0x9E3779B97F4A7C15ull,
+        h2 = h0 ^ 0xC2B2AE3D27D4EB4Full, h3 = h0 ^ 0x165667B19E3779F9ull;
+    u32 i = 0;
+    for (; i + 32 <= span; i += 32) {
+        u64 w0, w1, w2, w3;
+        memcpy(&w0, src + i, 8);
+        memcpy(&w1, src + i + 8, 8);
+        memcpy(&w2, src + i + 16, 8);
+        memcpy(&w3, src + i + 24, 8);
+        h0 = (h0 ^ w0) * P;
+        h1 = (h1 ^ w1) * P;
+        h2 = (h2 ^ w2) * P;
+        h3 = (h3 ^ w3) * P;
+    }
+    for (; i + 8 <= span; i += 8) {
+        u64 w;
+        memcpy(&w, src + i, 8);
+        h0 = (h0 ^ w) * P;
+    }
+    for (; i < span; i++)
+        h1 = (h1 ^ src[i]) * P;
+    u64 h = (h0 ^ h1) * P;
+    h = (h ^ h2) * P;
+    h = (h ^ h3) * P;
+    return (h ^ span) * P;
 }

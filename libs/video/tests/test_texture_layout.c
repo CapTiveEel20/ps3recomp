@@ -434,6 +434,49 @@ static void test_swizzle_offset(void)
         }
 }
 
+/* rsx_mutation_hash is a change detector: flipping any one byte of the
+ * source, at any position (all four lanes, the 8-byte tail, the byte tail),
+ * must change the result; equal bytes must hash equal; the length counts. */
+static void test_mutation_hash(void)
+{
+    static u8 buf[203];
+    for (u32 i = 0; i < sizeof buf; i++) buf[i] = (u8)(i * 37u + 11u);
+    for (u32 len = 0; len <= sizeof buf; len++) {
+        const u64 base = rsx_mutation_hash(buf, len);
+        CHECK_EQ(rsx_mutation_hash(buf, len), base);
+        int missed = 0;
+        for (u32 at = 0; at < len; at++)
+            for (u32 bit = 0; bit < 8; bit++) {
+                buf[at] ^= (u8)(1u << bit);
+                if (rsx_mutation_hash(buf, len) == base) missed++;
+                buf[at] ^= (u8)(1u << bit);
+            }
+        CHECK_EQ(missed, 0);
+        if (len) CHECK(rsx_mutation_hash(buf, len - 1) != base);
+    }
+}
+
+static void test_swizzle_texel_offset_64bit(void)
+{
+    /* 4-byte texels: plain Morton order. */
+    CHECK_EQ(rsx_swizzle_texel_offset(1, 0, 2, 2, 4), 1);
+    CHECK_EQ(rsx_swizzle_texel_offset(0, 1, 2, 2, 4), 2);
+    /* 8-byte texels interleave y first: (0,1) is the 2nd texel, (1,0) the 3rd. */
+    CHECK_EQ(rsx_swizzle_texel_offset(0, 1, 2, 2, 8), 1);
+    CHECK_EQ(rsx_swizzle_texel_offset(1, 0, 2, 2, 8), 2);
+    CHECK_EQ(rsx_swizzle_texel_offset(3, 3, 2, 2, 8), 15);
+    /* = the 32-bit-unit model: texel (x, y) is units (2x, y) and (2x+1, y) of
+     * a twice-as-wide image, every size up to 32x32, square or not. */
+    for (u32 lw = 0; lw <= 5; lw++)
+        for (u32 lh = 0; lh <= 5; lh++)
+            for (u32 y = 0; y < (1u << lh); y++)
+                for (u32 x = 0; x < (1u << lw); x++) {
+                    const u32 t = rsx_swizzle_texel_offset(x, y, lw, lh, 8);
+                    CHECK_EQ(rsx_swizzle_offset(2 * x, y, lw + 1, lh), 2 * t);
+                    CHECK_EQ(rsx_swizzle_offset(2 * x + 1, y, lw + 1, lh), 2 * t + 1);
+                }
+}
+
 static void test_log2_ceil(void)
 {
     CHECK_EQ(rsx_log2_ceil(1), 0);
@@ -856,6 +899,8 @@ int main(void)
     test_hilo();
     test_control3_pitch();
     test_swizzle_offset();
+    test_swizzle_texel_offset_64bit();
+    test_mutation_hash();
     test_log2_ceil();
     test_decode_argb_linear();
     test_decode_linear_argb_matches_texel_path();

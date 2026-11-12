@@ -1782,6 +1782,8 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
 /* ---------------------------------------------------------------------------
  * command list submit/wait (simple synchronous model, like the harness)
  * -----------------------------------------------------------------------*/
+static u32 g_ld_kick_draws;   /* draws since the list was last submitted (ld_kick) */
+
 static void ld_flush(ld_flush_reason reason)
 {
 #if defined(YZ_PERF_PROFILE)
@@ -1847,11 +1849,68 @@ static void ld_flush(ld_flush_reason reason)
     g.alloc->lpVtbl->Reset(g.alloc);
     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
     g.upload_used = 0;
+    g_ld_kick_draws = 0;
 #if defined(YZ_PERF_PROFILE)
     const u64 flush_ticks = (u64)(ld_profile_qpc() - flush_begin);
     g_ld_profile.total.flush_qpc += flush_ticks;
     g_ld_profile.total.flush_reason_qpc[reason] += flush_ticks;
 #endif
+}
+
+/* Mid-frame submit WITHOUT waiting ("kick").
+ *
+ * The frame used to reach the GPU in one piece at present, and the ticker then
+ * waited for all of it (~16% of the ticker in a Civilization Revolution match)
+ * while the GPU had sat idle during the whole recording. A kick hands the
+ * draws recorded so far to the queue and keeps recording into the same
+ * command list, so the GPU works while the CPU records; the present wait
+ * then covers only the tail.
+ *
+ * Same safety argument as a mid-frame ld_flush (vertex/descriptor ring full),
+ * which already splits frames at this exact point -- minus the wait:
+ *  - the allocator is NOT reset (the GPU still reads it); resetting the LIST
+ *    right after ExecuteCommandLists is allowed by D3D12;
+ *  - rings, the upload area and retired textures are only recycled by a full
+ *    ld_flush, which waits for every kicked list too (queue order + fence);
+ *  - each draw re-records its complete state (targets, heaps, root signature,
+ *    PSO, viewport), so nothing is lost across the list boundary.
+ * LD_KICK_DRAWS=<n>: kick every n draws (default 128); 0 = off (old). */
+static void ld_kick(void)
+{
+    const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
+    if (FAILED(close_hr)) {
+        fprintf(stderr, "[d3d-fail] command-list Close (kick) hr=0x%08lX frame=%u\n",
+                (unsigned long)close_hr, g_ld_frames);
+        ld_dump_dred("Close", close_hr);
+        g.ready = 0;
+        return;
+    }
+    ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    const HRESULT signal_hr =
+        g.queue->lpVtbl->Signal(g.queue, g.fence, ++g.fence_value);
+    if (FAILED(signal_hr)) {
+        fprintf(stderr, "[d3d-fail] queue Signal (kick) hr=0x%08lX frame=%u\n",
+                (unsigned long)signal_hr, g_ld_frames);
+        ld_dump_dred("Signal", signal_hr);
+        g.ready = 0;
+        return;
+    }
+    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+}
+
+static void ld_kick_maybe(void)
+{
+    static int every = -1;
+    if (every < 0) {
+        const char* e = getenv("LD_KICK_DRAWS");
+        every = e ? atoi(e) : 128;
+        if (every < 0) every = 0;
+    }
+    if (every && ++g_ld_kick_draws >= (u32)every) {
+        g_ld_kick_draws = 0;
+        ld_kick();
+    }
 }
 
 /* Public wrapper for the RSX SET_REFERENCE / sync fence: block until the GPU
@@ -1938,6 +1997,7 @@ static void ld_flush_present_async(void)
     g.alloc = next;
     g.alloc->lpVtbl->Reset(g.alloc);
     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    g_ld_kick_draws = 0;
 }
 
 /* Texture uploads append to the upload area until a full ld_flush resets it.
@@ -1975,6 +2035,18 @@ static u32 morton_index(u32 x, u32 y, u32 lw, u32 lh)
         if (lh) { idx |= (y & 1) << shift; y >>= 1; shift++; lh--; }
     }
     return idx;
+}
+/* Swizzled texel index by texel size: 8-byte texels (FP16 RGBA) interleave y
+ * first (rsx_swizzle_texel_offset). Read x-first, every FP16 cube in Civ Rev
+ * came out transposed: reflections hit the HDR sun instead of the horizon and
+ * shiny surfaces (city walls) saturated. LD_SWZ64_XFIRST=1 = old order. */
+static u32 swizzled_texel_index(u32 x, u32 y, u32 lw, u32 lh, u32 texel_size)
+{
+    static int xfirst = -1;
+    if (xfirst < 0) xfirst = getenv("LD_SWZ64_XFIRST") ? 1 : 0;
+    if (texel_size == 8 && !xfirst)
+        return rsx_swizzle_texel_offset(x, y, lw, lh, 8);
+    return morton_index(x, y, lw, lh);
 }
 static u8 remap_comp(const u8 s[4], u32 remap, u32 comp)
 {
@@ -2524,6 +2596,20 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
     return t->cubemap ? span * 6 : span;
 }
 
+/* Mutation detector for guest texture bytes (only ever compared with its own
+ * earlier result in this process). Four independent word-FNV lanes instead
+ * of one serial chain: each step (h ^ w) * P is a bijection of both h and w,
+ * so one changed word always changes its lane, and the final fold is a
+ * bijection of each lane -- the same guarantee as the single chain, ~4x the
+ * throughput (the serial chain was ~7% of the renderer thread, and the
+ * byte-at-a-time vertex-texture hash another ~5%). LD_FAST_HASH=0 = old. */
+static int ld_fast_hash_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("LD_FAST_HASH"); on = !(e && e[0] == '0'); }
+    return on;
+}
+
 static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
 {
     const u32 span = texture_source_span(t);
@@ -2560,6 +2646,10 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
 
     /* One hash per cached texture per presented frame.  Word-at-a-time FNV is
      * deliberately cheap; this is a mutation detector, not a content ID. */
+    if (ld_fast_hash_enabled()) {
+        *readable = 1;
+        return rsx_mutation_hash(src, span);
+    }
     u64 hash = 1469598103934665603ull;
     u32 i = 0;
     for (; i + 8 <= span; i += 8) {
@@ -2703,7 +2793,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
                             ? level_src + (size_t)y * pitch +
                                 (size_t)x * texel_size
                             : level_src +
-                                (size_t)morton_index(x, y, lw, lh) *
+                                (size_t)swizzled_texel_index(x, y, lw, lh, texel_size) *
                                     texel_size;
                         decode_texel(
                             base_fmt, pixel, remap,
@@ -2763,7 +2853,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
             for (u32 x = 0; x < mw; x++) {
                 const u8* pixel = linear
                     ? level_src + (size_t)y * pitch + (size_t)x * texel_size
-                    : level_src + (size_t)morton_index(x, y, lw, lh) * texel_size;
+                    : level_src + (size_t)swizzled_texel_index(x, y, lw, lh, texel_size) * texel_size;
                 decode_texel(base_fmt, pixel, remap,
                              rgba[n] + ((size_t)y * mw + x) * 4);
             }
@@ -3176,7 +3266,12 @@ static u64 vertex_texture_hash(const rsx_dsp_vertex_texture* vt,
     const u8* src = span ? guest_ptr(vt->location, vt->offset, span) : NULL;
     if (out_src) *out_src = src;
     if (out_pitch) *out_pitch = pitch;
-    return src ? fnv1a(src, span, 1469598103934665603ull) : 0;
+    if (!src) return 0;
+    if (ld_fast_hash_enabled()) {
+        const u64 h = rsx_mutation_hash(src, span);
+        return h ? h : 1;   /* 0 means "unreadable" to the callers */
+    }
+    return fnv1a(src, span, 1469598103934665603ull);
 }
 
 static ID3D12Resource* decode_vertex_texture(
@@ -5243,6 +5338,48 @@ static ID3D12PipelineState* build_pso(
     return SUCCEEDED(hr) ? pso : NULL;
 }
 
+/* Per-draw facts about the current vertex program, memoised on its exact
+ * bytes. Every draw used to walk the program four times (input analysis,
+ * branch-bit scan, and a byte-at-a-time FNV twice for the PSO key) although
+ * consecutive draws almost always share the program; a memcmp against the
+ * remembered copy is far cheaper and yields the very same values.
+ * LD_VP_MEMO=0 recomputes every time (old cost, same results). */
+typedef struct ld_vp_info {
+    int valid;
+    u32 bytes;                       /* vp_instrs * 16                    */
+    u64 fnv;                         /* fnv1a(ucode, bytes, FNV basis)    */
+    int analyze_rc;                  /* rsx_vp_analyze_inputs's result     */
+    rsx_vp_input_analysis analysis;  /* ...and its output, from {0xFFFF,0} */
+    int branch_bits;                 /* rsx_vp_uses_branch_bits           */
+    u8 ucode[RSX_DSP_VP_INSTR * 16];
+} ld_vp_info;
+
+static const ld_vp_info* ld_vp_info_get(const u8* vp_uc, u32 vp_instrs)
+{
+    enum { N = 4 };
+    static ld_vp_info memo[N];
+    static u32 next;
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("LD_VP_MEMO"); on = !(e && e[0] == '0'); }
+    const u32 bytes = vp_instrs * 16u;
+    if (on)
+        for (u32 i = 0; i < N; i++)
+            if (memo[i].valid && memo[i].bytes == bytes &&
+                memcmp(memo[i].ucode, vp_uc, bytes) == 0)
+                return &memo[i];
+    ld_vp_info* e = &memo[next];
+    next = (next + 1u) % N;
+    e->valid = 1;
+    e->bytes = bytes;
+    e->fnv = fnv1a(vp_uc, bytes, 1469598103934665603ull);
+    e->analysis.input_mask = 0xFFFFu;
+    e->analysis.exact = 0;
+    e->analyze_rc = rsx_vp_analyze_inputs(vp_uc, bytes, &e->analysis);
+    e->branch_bits = rsx_vp_uses_branch_bits(vp_uc, bytes);
+    memcpy(e->ucode, vp_uc, bytes);
+    return e;
+}
+
 static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
 {
     const u32 start = rsx_dsp_vp_start(&g.rsx);
@@ -5254,9 +5391,11 @@ static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
     const u32 vp_instrs = rsx_vp_program_size_instrs(
         vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
     rsx_vp_input_analysis analysis = {0xFFFFu, 0};
+    const ld_vp_info* info =
+        vp_instrs ? ld_vp_info_get(vp_uc, vp_instrs) : NULL;
+    if (info) analysis = info->analysis;
     if (!vp_instrs ||
-        rsx_vp_analyze_inputs(
-            vp_uc, vp_instrs * 16, &analysis) != (int)vp_instrs ||
+        info->analyze_rc != (int)vp_instrs ||
         !analysis.exact)
         analysis.input_mask = 0xFFFFu;
     ld_layout_plan_get(analysis.input_mask, layout);
@@ -5488,8 +5627,8 @@ static ID3D12PipelineState* get_pso(
     g.fp_alpha_ref = rsx_fp_alpha_ref(
         rs.alpha_ref_raw, rs.alpha_ref_format);
 
-    u64 key = fnv1a(
-        vp_uc, vp_instrs * 16, 1469598103934665603ull);
+    const ld_vp_info* vp_info = ld_vp_info_get(vp_uc, vp_instrs);
+    u64 key = vp_info->fnv;
     if (ld_fp_constants_buffered())
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
     else
@@ -5507,7 +5646,7 @@ static ID3D12PipelineState* get_pso(
     if (expand_units) key = fnv1a(expand_masks, sizeof(expand_masks), key);
     if (srgb_output) key = fnv1a(&srgb_output, sizeof(srgb_output), key);
     /* BRB/CLB outcomes are baked into the program (rsx_vp_set_branch_bits). */
-    const int vp_branch_bits_used = rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16);
+    const int vp_branch_bits_used = vp_info->branch_bits;
     const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
     if (vp_branch_bits_used)
         key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
@@ -5577,8 +5716,7 @@ static ID3D12PipelineState* get_pso(
 #endif
     g_ld_current_pso.valid = 1;
     g_ld_current_pso.key = key;
-    g_ld_current_pso.vp_hash = fnv1a(
-        vp_uc, vp_instrs * 16, 1469598103934665603ull);
+    g_ld_current_pso.vp_hash = vp_info->fnv;
     g_ld_current_pso.vp_start = start;
     g_ld_current_pso.vp_instrs = vp_instrs;
     g_ld_current_pso.fp_location = fp_loc;
@@ -6137,9 +6275,127 @@ static void fetch_batches(void)
         }
 }
 
+/* LD_FETCH_MANY=0: convert vertices one at a time (rsx_vertex_fetch_one), the
+ * old live path. Default: rsx_vertex_fetch_many, attribute by attribute --
+ * the same bytes (test_vertex_fetch_plan), the loop the draw engine uses.
+ * LD_REMAP_DENSE=0: de-duplicate vertex refs through the hash table only. */
+static int ld_fetch_many_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("LD_FETCH_MANY");
+        on = !(e && e[0] == '0');
+        const char* d = getenv("LD_REMAP_DENSE");
+        if (d && d[0] == '0') rsx_vertex_remap_set_dense(0);
+    }
+    return on;
+}
+
+/* LD_SPAN_REMAP=0: every draw de-duplicates its references one by one (old).
+ * Default: an index-array draw whose ids span no more ids than it has
+ * references decodes the indices straight into the occurrence map and fetches
+ * the whole id span (rsx_vertex_remap_from_span); a draw-arrays draw whose
+ * batches do not overlap has only unique references and skips the de-dup.
+ * Per [fps] window: [vtx] references, fetched vertices, draws per path. */
+static int ld_span_remap_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("LD_SPAN_REMAP"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static u64 g_ld_vtx_refs, g_ld_vtx_fetched, g_ld_vtx_span_draws,
+           g_ld_vtx_array_draws, g_ld_vtx_other_draws;
+
+/* 1 = handled (refs, occurrence map, cuts, counts set, or fetch_ok cleared);
+ * 0 = not applicable, nothing changed: take the per-reference path. */
+static int ld_fetch_indices_span(void)
+{
+    const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
+    rsx_dsp_index_array index_array;
+    rsx_dsp_get_index_array(&g.rsx, &index_array);
+    const u32 element_size = index_array.is_u32 ? 4u : 2u;
+    static int no_restart = -1;
+    if (no_restart < 0)
+        no_restart = getenv("RSX_NO_RESTART") ? 1 : 0;
+    const int restart_enabled =
+        !no_restart &&
+        rsx_dsp_restart_index_enabled(&g.rsx, index_array.is_u32);
+    const u32 restart_value = rsx_dsp_restart_index(&g.rsx);
+
+    u64 total = 0;
+    for (u32 batch = 0; batch < dc.n_idx; batch++)
+        total += dc.idx[batch].count;
+    if (total < 2 || total > 0x10000000u)
+        return 0;
+    u32* const ids = rsx_vertex_remap_reserve(&dc.ref_remap, (u32)total);
+    if (!ids)
+        return 0;
+
+    u32 n = 0;
+    for (u32 batch = 0; batch < dc.n_idx; batch++) {
+        const u32 count = dc.idx[batch].count;
+        if (!count) continue;
+        const u64 start64 = (u64)index_array.offset +
+                            (u64)dc.idx[batch].first * element_size;
+        const u64 bytes64 = (u64)count * element_size;
+        const u8* source = start64 + bytes64 <= 0x100000000ull
+            ? guest_ptr(index_array.location, (u32)start64, (u32)bytes64)
+            : NULL;
+        if (!source) { dc.n_cuts = 0; return 0; }
+        for (u32 i = 0; i < count; i++) {
+            const u8* p = source + (size_t)i * element_size;
+            const u32 index = index_array.is_u32
+                ? (((u32)p[0] << 24) | ((u32)p[1] << 16) |
+                   ((u32)p[2] << 8) | p[3])
+                : (u32)((p[0] << 8) | p[1]);
+            if (restart_enabled && index == restart_value) {
+                if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts,
+                                          n)) {
+                    dc.fetch_ok = 0;
+                    return 1;
+                }
+                continue;
+            }
+            ids[n++] = index;
+        }
+    }
+    u32 unique = 0;
+    if (n < 2 ||
+        !rsx_vertex_remap_from_span(&dc.ref_remap, n, base_index, n,
+                                    &dc.refs, &dc.cap_refs, &unique)) {
+        dc.n_cuts = 0;
+        return 0;
+    }
+    dc.n_refs = unique;
+    dc.n_source_refs = n;
+    dc.refs_remapped = 1;
+    return 1;
+}
+
+/* Draw-arrays batches in ascending order without overlap: every reference
+ * is a distinct vertex, so the de-dup could only return them unchanged. */
+static int ld_arrays_disjoint(void)
+{
+    if (dc.n_idx || dc.n_elem) return 0;
+    for (u32 batch = 1; batch < dc.n_arr; batch++)
+        if (dc.arr[batch].first <
+            (u64)dc.arr[batch - 1].first + dc.arr[batch - 1].count)
+            return 0;
+    return 1;
+}
+
 static void fetch_batches_hoisted(
     const rsx_vertex_layout_plan* layout, int packed_payload)
 {
+    (void)ld_fetch_many_enabled();   /* applies LD_REMAP_DENSE before remap */
+    const int span_path = packed_payload && ld_span_remap_enabled();
+    if (span_path && dc.n_idx && !dc.n_arr && !dc.n_elem &&
+        ld_fetch_indices_span()) {
+        if (!dc.fetch_ok)
+            return;
+        g_ld_vtx_span_draws++;
+        goto refs_ready;
+    }
     for (u32 batch = 0; batch < dc.n_arr && dc.fetch_ok; batch++)
         for (u32 i = 0; i < dc.arr[batch].count && dc.fetch_ok; i++)
             push_compact_ref(dc.arr[batch].first + i, 0);
@@ -6209,7 +6465,10 @@ static void fetch_batches_hoisted(
     if (!dc.fetch_ok)
         return;
     dc.n_source_refs = dc.n_refs;
-    if (packed_payload && dc.n_refs > 1) {
+    if (span_path && ld_arrays_disjoint()) {
+        g_ld_vtx_array_draws++;
+    } else if (packed_payload && dc.n_refs > 1) {
+        g_ld_vtx_other_draws++;
         u32 unique_refs = dc.n_refs;
         if (rsx_vertex_remap_build(
                 &dc.ref_remap, dc.refs, dc.n_refs, &unique_refs)) {
@@ -6217,6 +6476,9 @@ static void fetch_batches_hoisted(
             dc.n_refs = unique_refs;
         }
     }
+refs_ready:
+    g_ld_vtx_refs += dc.n_source_refs;
+    g_ld_vtx_fetched += dc.n_refs;
     dc.layout = *layout;
     rsx_vertex_fetch_plan_init(
         &dc.fetch_plan, &g.rsx, layout,
@@ -6234,6 +6496,12 @@ static void fetch_batches_hoisted(
             dc.fetch_ok = 0;
             return;
         }
+        if (ld_fetch_many_enabled()) {
+            if (!rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, dc.n_refs,
+                                       dc.compact_verts))
+                dc.fetch_ok = 0;
+            if (!dc.fetch_ok) return;
+        } else
         for (u32 i = 0; i < dc.n_refs; i++) {
             u8* destination = layout->stride
                 ? dc.compact_verts + (u64)i * layout->stride : NULL;
@@ -6261,6 +6529,12 @@ static void fetch_batches_hoisted(
             dc.fetch_ok = 0;
             return;
         }
+        if (ld_fetch_many_enabled()) {
+            if (!rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, dc.n_refs,
+                                       (u8*)dc.verts))
+                dc.fetch_ok = 0;
+            if (!dc.fetch_ok) return;
+        } else
         for (u32 i = 0; i < dc.n_refs; i++) {
             if (!rsx_vertex_fetch_one(
                     &dc.fetch_plan, &dc.refs[i],
@@ -7359,9 +7633,52 @@ ld_csv_row:;
                             fprintf(rf, "c%03u %g %g %g %g\n", c, ld_c2f(q[0]), ld_c2f(q[1]),
                                     ld_c2f(q[2]), ld_c2f(q[3]));
                     }
+                    /* fragment-program inline constants (fp_constants[] in the HLSL) */
+                    for (u32 c = 0; c < g.fp_constants.count; c++) {
+                        const u32* q = g.fp_constants.values[c];
+                        fprintf(rf, "fp%u %g %g %g %g\n", c, ld_c2f(q[0]), ld_c2f(q[1]),
+                                ld_c2f(q[2]), ld_c2f(q[3]));
+                    }
                     fclose(rf);
                 }
                 fprintf(out, "#regs,%u,%s\n", s_cap_idx, path);
+                /* Raw guest bytes of every bound texture, once per address per
+                 * capture: tex_<loc>_<offset>_f<fmt>_<w>x<h>[c]_m<mips>.bin.
+                 * Decoded offline (cube faces, FP16 env maps, ...). */
+                {   static u32 seen_loc[256], seen_off[256], n_seen;
+                    if (s_cap_idx == 0) n_seen = 0;
+                    for (u32 u = 0; u < 16; u++) {
+                        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+                        if (!t.enabled || !t.width || !t.height) continue;
+                        u32 k = 0;
+                        while (k < n_seen && !(seen_loc[k] == t.location && seen_off[k] == t.offset)) k++;
+                        if (k < n_seen || n_seen >= 256) continue;
+                        seen_loc[n_seen] = t.location; seen_off[n_seen] = t.offset; n_seen++;
+                        const u32 base = t.format & 0x9Fu;
+                        const u32 bits = base == 0x86 ? 4 : (base == 0x87 || base == 0x88) ? 8
+                                       : base == 0x81 ? 8 : (base == 0x82 || base == 0x83 || base == 0x84 || base == 0x8B) ? 16
+                                       : base == 0x9A ? 64 : base == 0x9B ? 128 : 32;
+                        u64 face = 0; u32 w = t.width, h = t.height;
+                        for (u32 m = 0; m < (t.mipmaps ? t.mipmaps : 1u); m++) {
+                            const u64 bw = (base >= 0x86 && base <= 0x88) ? ((w + 3) / 4) * 4 : w;
+                            const u64 bh = (base >= 0x86 && base <= 0x88) ? ((h + 3) / 4) * 4 : h;
+                            face += t.pitch && m == 0 && !(base >= 0x86 && base <= 0x88)
+                                    ? (u64)t.pitch * h : bw * bh * bits / 8;
+                            w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1;
+                        }
+                        u64 total = (t.cubemap ? ((face + 127) & ~127ull) * 6 : face) + 4096;
+                        if (total > 64ull << 20) total = 64ull << 20;
+                        const u8* p = guest_ptr(t.location, t.offset, (u32)total);
+                        if (!p) { total -= 4096; p = guest_ptr(t.location, t.offset, (u32)total); }
+                        if (!p) continue;
+                        char tp[MAX_PATH * 2];
+                        snprintf(tp, sizeof(tp), "%s/tex_%u_%08X_f%02X_%ux%u%s_m%u_p%u_r%04X_a%08X.bin",
+                                 s_cap_dir, t.location, t.offset, t.format & 0xFF, t.width, t.height,
+                                 t.cubemap ? "c" : "", t.mipmaps, t.pitch, t.remap & 0xFFFF, t.wrap);
+                        FILE* tf = fopen(tp, "wb");
+                        if (tf) { fwrite(p, 1, (size_t)total, tf); fclose(tf); }
+                    }
+                }
             }
             last_vh = vh; last_vv = vv;
             s_cap_shader_new = 0;
@@ -7891,8 +8208,11 @@ static u32 topology_index_count(u32 prim)
 
 static u32 topology_vertex_index(u32 occurrence)
 {
-    return dc.refs_remapped
-        ? rsx_vertex_remap_index(&dc.ref_remap, occurrence)
+    /* rsx_vertex_remap_index, inlined: it is called once per index and was
+     * 2.6% of the renderer thread as an out-of-line call. */
+    return dc.refs_remapped &&
+           occurrence < dc.ref_remap.occurrence_capacity
+        ? dc.ref_remap.occurrence_to_unique[occurrence]
         : occurrence;
 }
 
@@ -8061,6 +8381,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_stats.group_drop_ring++;
         return;
     }
+    /* Nothing of this draw is recorded yet: the same point the ring-full
+     * flush below uses, so splitting the list here loses no state. */
+    ld_kick_maybe();
+    if (!g.ready) return;
     if ((u64)g.vb_used + draw_vb_bytes > vb_capacity ||
         (u64)g.ib_used + draw_ib_bytes > INDEX_BUFFER_SIZE) {
         /*
@@ -9401,6 +9725,12 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     }
     sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&g.swap);
     sc1->lpVtbl->Release(sc1);
+    /* No DXGI Alt+Enter: its exclusive fullscreen needs ResizeBuffers, which
+     * this renderer never does; after the switch Present failed with
+     * DXGI_ERROR_INVALID_CALL (0x887A0001) and g.ready=0 froze the picture.
+     * The window (rsx_null_backend.c) does borderless fullscreen instead. */
+    factory->lpVtbl->MakeWindowAssociation(factory, (HWND)hwnd,
+                                           DXGI_MWA_NO_ALT_ENTER);
     factory->lpVtbl->Release(factory);
 
     /* RTV heap: [0..1] backbuffers, [2..] surface cache */
@@ -11433,6 +11763,13 @@ void rsx_live_draw_present(u32 buffer_id)
           fprintf(stderr, "[fps] %.1f (frames %u..%u over %.1fs)\n",
                   (g_ld_frames - fps_f0) * 1000.0 / (double)(now - fps_t0),
                   fps_f0, g_ld_frames, (now - fps_t0) / 1000.0);
+          { const double frames = g_ld_frames > fps_f0 ? (double)(g_ld_frames - fps_f0) : 1.0;
+            fprintf(stderr, "[vtx] per frame: refs %.0f fetched %.0f | draws span %.0f arrays %.0f dedup %.0f\n",
+                    g_ld_vtx_refs / frames, g_ld_vtx_fetched / frames,
+                    g_ld_vtx_span_draws / frames, g_ld_vtx_array_draws / frames,
+                    g_ld_vtx_other_draws / frames);
+            g_ld_vtx_refs = g_ld_vtx_fetched = 0;
+            g_ld_vtx_span_draws = g_ld_vtx_array_draws = g_ld_vtx_other_draws = 0; }
           fps_t0 = now; fps_f0 = g_ld_frames;
       } }
     /* RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --

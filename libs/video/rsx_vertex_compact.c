@@ -413,6 +413,83 @@ static u64 rsx_vertex_remap_hash(u64 value)
     return value;
 }
 
+static int s_remap_dense = 1;
+
+int rsx_vertex_remap_set_dense(int enabled)
+{
+    const int previous = s_remap_dense;
+    s_remap_dense = enabled != 0;
+    return previous;
+}
+
+/* Same contract and same result as the hash path below, for the common case
+ * of an indexed draw: every ref has one base_index and the vertex ids sit in
+ * a narrow range, so "seen this vertex?" is an array lookup at id - lowest.
+ * The hash path costs a 64-bit mix and a probe into a table twice the size
+ * of the draw per reference (~8% of the renderer thread in a Civilization
+ * Revolution match). Returns 0, untouched, when the refs don't fit. */
+static int rsx_vertex_remap_build_dense(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* unique_count)
+{
+    const u32 base_index = refs[0].base_index;
+    u32 lowest = refs[0].vertex_id, highest = lowest;
+    for (u32 i = 1; i < count; i++) {
+        if (refs[i].base_index != base_index)
+            return 0;
+        const u32 id = refs[i].vertex_id;
+        if (id < lowest) lowest = id;
+        if (id > highest) highest = id;
+    }
+    const u32 span = highest - lowest;
+    /* Bounded memory (16 MB worst case) and no sparse-range blowup. */
+    if (span >= (1u << 21) || (u64)span > (u64)count * 8u + 4096u)
+        return 0;
+    const u32 needed = span + 1u;
+    if (needed > remap->dense_capacity) {
+        u32 capacity = remap->dense_capacity ? remap->dense_capacity : 4096u;
+        while (capacity < needed) capacity *= 2u;
+        u32* stamp = (u32*)calloc(capacity, sizeof(u32));
+        u32* value = (u32*)malloc((size_t)capacity * sizeof(u32));
+        if (!stamp || !value) {
+            free(stamp);
+            free(value);
+            return 0;
+        }
+        free(remap->dense_stamp);
+        free(remap->dense_value);
+        remap->dense_stamp = stamp;
+        remap->dense_value = value;
+        remap->dense_capacity = capacity;
+        remap->dense_generation = 0;
+    }
+    if (++remap->dense_generation == 0) {
+        memset(remap->dense_stamp, 0,
+               (size_t)remap->dense_capacity * sizeof(u32));
+        remap->dense_generation = 1;
+    }
+    const u32 generation = remap->dense_generation;
+    u32* const stamp = remap->dense_stamp;
+    u32* const value = remap->dense_value;
+    u32* const occurrence_to_unique = remap->occurrence_to_unique;
+    u32 unique = 0;
+    for (u32 occurrence = 0; occurrence < count; occurrence++) {
+        const u32 vertex_id = refs[occurrence].vertex_id;
+        const u32 at = vertex_id - lowest;
+        if (stamp[at] != generation) {
+            stamp[at] = generation;
+            value[at] = unique;
+            refs[unique].vertex_id = vertex_id;
+            refs[unique].base_index = base_index;
+            occurrence_to_unique[occurrence] = unique++;
+        } else {
+            occurrence_to_unique[occurrence] = value[at];
+        }
+    }
+    *unique_count = unique;
+    return 1;
+}
+
 int rsx_vertex_remap_build(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
     u32* unique_count)
@@ -431,6 +508,10 @@ int rsx_vertex_remap_build(
         remap->occurrence_to_unique = occurrences;
         remap->occurrence_capacity = count;
     }
+
+    if (s_remap_dense && rsx_vertex_remap_build_dense(remap, refs, count,
+                                                      unique_count))
+        return 1;
 
     if (count > UINT_MAX / 2u)
         return 0;
@@ -488,6 +569,59 @@ int rsx_vertex_remap_build(
     return 1;
 }
 
+u32* rsx_vertex_remap_reserve(rsx_vertex_remap* remap, u32 count)
+{
+    if (!remap)
+        return NULL;
+    if (count > remap->occurrence_capacity) {
+        u32* occurrences = (u32*)realloc(
+            remap->occurrence_to_unique, (size_t)count * sizeof(u32));
+        if (!occurrences)
+            return NULL;
+        remap->occurrence_to_unique = occurrences;
+        remap->occurrence_capacity = count;
+    }
+    return remap->occurrence_to_unique;
+}
+
+int rsx_vertex_remap_from_span(
+    rsx_vertex_remap* remap, u32 count, u32 base_index, u32 max_span,
+    rsx_vertex_ref** refs, u32* refs_capacity, u32* unique_count)
+{
+    if (!remap || !refs || !refs_capacity || !unique_count || !count ||
+        count > remap->occurrence_capacity)
+        return 0;
+    u32* const occurrence_to_unique = remap->occurrence_to_unique;
+    u32 lowest = occurrence_to_unique[0], highest = lowest;
+    for (u32 occurrence = 1; occurrence < count; occurrence++) {
+        const u32 id = occurrence_to_unique[occurrence];
+        lowest = id < lowest ? id : lowest;
+        highest = id > highest ? id : highest;
+    }
+    const u64 span = (u64)highest - lowest + 1u;
+    if (span > max_span)
+        return 0;
+    if (span > *refs_capacity) {
+        u32 capacity = *refs_capacity ? *refs_capacity : 4096u;
+        while (capacity < span) capacity *= 2u;
+        rsx_vertex_ref* grown = (rsx_vertex_ref*)realloc(
+            *refs, (size_t)capacity * sizeof(**refs));
+        if (!grown)
+            return 0;
+        *refs = grown;
+        *refs_capacity = capacity;
+    }
+    rsx_vertex_ref* const out = *refs;
+    for (u32 i = 0; i < (u32)span; i++) {
+        out[i].vertex_id = lowest + i;
+        out[i].base_index = base_index;
+    }
+    for (u32 occurrence = 0; occurrence < count; occurrence++)
+        occurrence_to_unique[occurrence] -= lowest;
+    *unique_count = (u32)span;
+    return 1;
+}
+
 u32 rsx_vertex_remap_index(
     const rsx_vertex_remap* remap, u32 occurrence)
 {
@@ -501,6 +635,8 @@ void rsx_vertex_remap_destroy(rsx_vertex_remap* remap)
         return;
     free(remap->occurrence_to_unique);
     free(remap->slots);
+    free(remap->dense_stamp);
+    free(remap->dense_value);
     memset(remap, 0, sizeof(*remap));
 }
 

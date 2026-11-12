@@ -44,6 +44,12 @@ typedef struct rsx_vertex_remap {
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    /* Dense path: one shared base_index and a narrow vertex_id span index a
+     * plain array (stamp = generation it was set in) instead of the hash. */
+    u32* dense_stamp;
+    u32* dense_value;
+    u32 dense_capacity;
+    u32 dense_generation;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {
@@ -135,6 +141,27 @@ int rsx_vertex_fetch_many(
 int rsx_vertex_remap_build(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
     u32* unique_count);
+
+/* The dense path is on by default and gives exactly the hash path's result;
+ * 0 forces the hash path (tests, kill switch). Returns the previous value. */
+int rsx_vertex_remap_set_dense(int enabled);
+
+/* Room for `count` occurrences in remap->occurrence_to_unique (NULL when it
+ * cannot grow). A caller can decode raw vertex ids straight into it and then
+ * call rsx_vertex_remap_from_span. */
+u32* rsx_vertex_remap_reserve(rsx_vertex_remap* remap, u32 count);
+
+/* Indexed-draw path without a per-reference de-dup. On entry
+ * occurrence_to_unique[0..count) holds raw vertex ids (one base_index). When
+ * they span lo..hi with hi - lo + 1 <= max_span, *refs becomes every id of
+ * that span in order and each occurrence is rebased to id - lo: every
+ * occurrence names the same vertex as rsx_vertex_remap_build would, so the
+ * drawn triangles are identical; ids inside the span that no occurrence uses
+ * are fetched as well, which is why the span is bounded. Returns 0 and changes
+ * nothing when the span is too wide or *refs cannot grow. */
+int rsx_vertex_remap_from_span(
+    rsx_vertex_remap* remap, u32 count, u32 base_index, u32 max_span,
+    rsx_vertex_ref** refs, u32* refs_capacity, u32* unique_count);
 
 u32 rsx_vertex_remap_index(
     const rsx_vertex_remap* remap, u32 occurrence);
