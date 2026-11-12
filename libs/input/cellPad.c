@@ -187,8 +187,12 @@ static unsigned long long pad_now_ms(void);
 /* The two host motor levels (0-65535) for a PS3 actuator request. */
 static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
 {
-    *lo = (u16)(large * 257u);
-    *hi = small_on ? 0xFFFFu : 0u;
+    /* PAD_RUMBLE=0: the player switched vibration off (a port's launcher
+     * setting, for titles with no in-game option). */
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PAD_RUMBLE"); on = !(e && *e == '0'); }
+    *lo = on ? (u16)(large * 257u) : 0u;
+    *hi = (on && small_on) ? 0xFFFFu : 0u;
 }
 
 /* Keyboard fallback for port 0.
