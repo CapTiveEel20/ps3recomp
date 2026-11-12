@@ -167,6 +167,7 @@ extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
  * runtime-struct walk). Print the faulting address and the RIP as a module
  * offset (RVA) so it can be symbolized with llvm-symbolizer against the PDB. */
 extern "C" uint32_t    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
+extern "C" void        cellGcm_debug_report(void);   /* cellGcmSys.c: F11 ring report */
 extern "C" const char* g_last_hle_name;
 
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
@@ -1060,6 +1061,7 @@ static DWORD WINAPI hang_watchdog(LPVOID)
         if (fg) GetWindowThreadProcessId(fg, &pid);
         if (pid != GetCurrentProcessId() || !(GetAsyncKeyState(VK_F11) & 0x8000)) continue;
         snprintf(lbl, sizeof lbl, "F11 sample #%d", n++); dump_threads(lbl, self);
+        cellGcm_debug_report();   /* RSX ring state ([FIFOWHY]) */
         while (GetAsyncKeyState(VK_F11) & 0x8000) Sleep(50);   /* one per press */
     }
 }

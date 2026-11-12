@@ -1964,10 +1964,27 @@ static void gcm_fifo_dump_around(u32 getoff)
  * that reads differently later was written AFTER the walker passed it (walker
  * ran ahead of the title's writes); unchanged garbage means the title reused
  * the memory before the walker reached it. */
+static volatile int s_last_label_idx = -1;   /* last cellGcmGetLabelAddress index */
+static void gcm_fifo_report_body(u32 getoff, u32 put);
 static void gcm_fifo_freeze_report(u32 getoff, u32 put)
 {
     static int d = 0;
     if (!PS3_LOG_FIRST(d, 2)) return;
+    gcm_fifo_report_body(getoff, put);
+}
+
+/* F11 (boot_main watchdog): the same report on demand, for a hang with no bad
+ * branch -- e.g. the title waiting on a label while the walker idles. */
+void cellGcm_debug_report(void)
+{
+    static int d = 0;
+    if (!PS3_LOG_FIRST(d, 4)) return;
+    fprintf(stderr, "[FIFOWHY] F11 report\n");
+    gcm_fifo_report_body(s_fifo_getoff, vm_read32(GCM_CONTROL_GUEST_ADDR + 0));
+}
+
+static void gcm_fifo_report_body(u32 getoff, u32 put)
+{
     extern unsigned long long ps3_ms_now(void);
     const unsigned long long now = ps3_ms_now();
     u32 ctx = s_gcm_ctx_out_ea ? vm_read32(s_gcm_ctx_out_ea) : 0;
@@ -1977,6 +1994,10 @@ static void gcm_fifo_freeze_report(u32 getoff, u32 put)
             ctx ? vm_read32(ctx + 0x0) : 0, ctx ? vm_read32(ctx + 0x4) : 0,
             ctx ? vm_read32(ctx + 0x8) : 0, ctx ? gcm_ea2io(vm_read32(ctx + 0x8)) : 0,
             s_fifo_recycle_waiting, s_fifo_back_jumps);
+    if (s_last_label_idx >= 0)
+        fprintf(stderr, "[FIFOWHY] last polled label %d = 0x%08X; drained=%08X\n", s_last_label_idx,
+                vm_read32(GCM_LABEL_GUEST_BASE + (u32)s_last_label_idx * GCM_LABEL_STRIDE),
+                g_gcm_fifo_drained_ea);
     const long n_ev = s_ev_i;
     for (long i = n_ev > GCM_EV_N ? n_ev - GCM_EV_N : 0; i < n_ev; i++) {
         const int k = (int)(i % GCM_EV_N);
@@ -3330,8 +3351,44 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * consumes the tail, follows the jump, and idles at begin; then it's safe
      * for the guest to write from begin (that region was consumed long ago). */
     u32 io_begin = gcm_ea2io(begin);
-    const u32 back_jumps0 = s_fifo_back_jumps;
     gcm_ev('R', gcm_ea2io(current), io_begin);
+
+    /* Two steps when the walker is sitting at `begin`. put = begin at once is
+     * ambiguous there: a walker that finished the last lap idles at begin, and
+     * if it has not yet looked at the put the title flushed for this lap, the
+     * new put == get reads as "nothing to do". It never runs the lap, never
+     * takes the jump, the wait below gives up and the title overwrites the
+     * lap. Civ Rev froze that way (get = put = begin, current at the end, the
+     * title waiting on a label released inside the lost lap). So first put =
+     * the JUMP's slot and wait for the walker to get there (it runs the lap
+     * and stops before the jump), then put = begin as before.
+     * GCM_RECYCLE_ONESTEP=1 = the old single step. */
+    const u32 io_cur = gcm_ea2io(current);
+    static int s_onestep = -1;
+    if (s_onestep < 0) { const char* e = getenv("GCM_RECYCLE_ONESTEP"); s_onestep = (e && *e == '1') ? 1 : 0; }
+    if (!s_onestep && io_begin != 0xFFFFFFFFu && io_cur != 0xFFFFFFFFu &&
+        s_fifo_getoff == io_begin) {
+        vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
+        atomic_thread_fence(memory_order_release);
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_cur);          /* put = the JUMP */
+        if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+        int spins = 0, idle = 0;
+        u32 last_get = s_fifo_getoff;
+        s_fifo_recycle_waiting = 1;
+        while (s_fifo_getoff != io_cur && idle < 2000 && spins < 60000) {
+            Sleep(1); spins++;
+            if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
+            else idle++;
+        }
+        if (s_fifo_getoff != io_cur) {
+            static int warned = 0;
+            if (PS3_LOG_FIRST(warned, 4))
+                printf("[cellGcmSys] fifo recycle: walker did not reach the wrap jump (get=0x%08X jump=0x%08X, %d ms)\n",
+                       s_fifo_getoff, io_cur, spins);
+        }
+    }
+
+    const u32 back_jumps0 = s_fifo_back_jumps;
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
         /* The jump has to be in guest memory before `put` moves behind the
@@ -3372,6 +3429,9 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
         if (PS3_LOG_FIRST(warned, 4))
             printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X, %d ms)\n",
                    g_gcm_fifo_drained_ea, begin, spins);
+        /* Civ Rev froze once right after this (walker idle at begin, title
+         * then waiting on a label for ever): the event history says why. */
+        gcm_fifo_freeze_report(s_fifo_getoff, vm_read32(GCM_CONTROL_GUEST_ADDR + 0));
     }
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
@@ -4213,6 +4273,7 @@ u32* cellGcmGetLabelAddress(u8 index)
     { static int n = 0; if (n++ < 32)   /* TEMP */
         fprintf(stderr, "[cellGcmSys] GetLabelAddress(0x%X) -> 0x%08X\n", index,
                 GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE); }
+    s_last_label_idx = index;   /* [FIFOWHY]: which label a stuck title polls */
     return (u32*)(uintptr_t)(GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE);
 }
 
