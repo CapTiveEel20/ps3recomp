@@ -2338,6 +2338,21 @@ static void spu_task_exit_record(const spu_context* ctx)
     s_task_exit_valid = 1;
 }
 void spu_task_exit_code_reset(void) { s_task_exit_valid = 0; s_task_exit_code = 0; }
+
+/* A pooled SPU job thread (spu_workload.c) runs one task after another. Put
+ * every thread-local of this file back to what a new thread starts with, so a
+ * task never sees the previous task's halt state, exit code or cache entries. */
+void spu_channels_thread_reset(void)
+{
+    s_spu_halt_armed = 0;
+    memset(&s_spu_halt_env, 0, sizeof(s_spu_halt_env));
+    s_task_exit_valid = 0;
+    s_task_exit_code = 0;
+    memset(&s_mfc_recent, 0, sizeof(s_mfc_recent));
+    t_ft_busy0 = 0;
+    memset(t_lookup_memo, 0, sizeof(t_lookup_memo));
+    memset(t_dcache, 0, sizeof(t_dcache));
+}
 int spu_task_exit_code_get(uint32_t* code)
 {
     if (code) *code = s_task_exit_code;

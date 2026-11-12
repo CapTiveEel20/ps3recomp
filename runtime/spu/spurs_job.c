@@ -155,6 +155,14 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
  * two jobs that both think they are SPU 0 corrupt each other's ring. */
 SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
 void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
+/* Pooled SPU job thread: back to a new thread's state (spu_workload.c). */
+void spurs_job_thread_reset(void)
+{
+    g_spurs_job_mbox = g_spurs_job_mbox_intr = 0;
+    g_spurs_job_cmd = 0;
+    g_spurs_job_mbox_valid = 0;
+    g_spurs_job_spu_num = 0;
+}
 
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)

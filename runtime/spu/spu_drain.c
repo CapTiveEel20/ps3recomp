@@ -64,6 +64,14 @@ extern void spu_halt(spu_context*);
  * on every drain transfer. */
 typedef struct spu_recent_history { uint32_t pc[32]; uint32_t n; } spu_recent_history;
 static _Thread_local spu_recent_history t_recent;
+/* Pooled SPU job thread: back to a new thread's state (spu_workload.c). */
+void spu_drain_thread_reset(void)
+{
+    g_spu_trampoline_fn = 0;
+    memset(g_spu_pch, 0, sizeof(g_spu_pch));
+    g_spu_pch_n = 0;
+    memset(&t_recent, 0, sizeof(t_recent));
+}
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 {
     unsigned n = t_recent.n < 32 ? t_recent.n : 32, k = n < max ? n : max;

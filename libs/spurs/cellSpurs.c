@@ -1651,8 +1651,13 @@ static void spurs_exit_wait_stats(long long t0)
     n++; sum += us; if (us > mx) mx = us;
     const double secs = (double)(now.QuadPart - win_start) / (double)f.QuadPart;
     if (secs >= 5.0) {
-        fprintf(stderr, "[spurs] exit-code waits: %.0f/s, avg %.0f us, max %.0f us (%s)\n",
-                n / secs, sum / n, mx, spurs_exit_wake_enabled() ? "wake" : "poll");
+        extern void spu_pool_stats(long long* created, long long* reused);
+        long long pool_created = 0, pool_reused = 0;
+        spu_pool_stats(&pool_created, &pool_reused);
+        fprintf(stderr, "[spurs] exit-code waits: %.0f/s, avg %.0f us, max %.0f us (%s)"
+                " | spu threads created %lld, tasks on parked threads %lld\n",
+                n / secs, sum / n, mx, spurs_exit_wake_enabled() ? "wake" : "poll",
+                pool_created, pool_reused);
         win_start = now.QuadPart; n = 0; sum = 0; mx = 0;
     }
     ReleaseSRWLockExclusive(&lk);

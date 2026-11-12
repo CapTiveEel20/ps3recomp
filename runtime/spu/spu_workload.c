@@ -1094,6 +1094,141 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
 #endif
 
+#ifdef _WIN32
+/* ---- Pooled SPU job threads (Windows) --------------------------------------
+ * Every async task used to get a brand-new host thread: ~21 us of CreateThread
+ * on the dispatching PPU thread and ~47 us before the task ran (measured,
+ * civrev-port/scratch/spupool/tcreate.c), while a parked thread starts in ~2 us.
+ * Civilization Revolution dispatches ~700 tasks/s in a match and its main
+ * thread waits for each one's exit code (cellSpursTaskExitCodeGet).
+ *
+ * The pool is elastic, so it can never run fewer tasks at once than before: a
+ * task goes to a parked worker if there is one, else to a new thread made
+ * exactly as before. A worker parks again after its task (at most
+ * SPU_POOL_IDLE, default 16; beyond that it exits). A persistent task that
+ * never returns simply keeps its worker, as it kept its own thread.
+ *
+ * Between tasks the worker does what thread exit used to do -- drop its stack
+ * from the lock-line reserver sets -- and resets every SPU-side thread-local
+ * to a new thread's value (spu_thread_job_reset). Image 22 (a task with
+ * function-local per-thread counters) always gets its own thread.
+ * SPU_POOL=0: a new thread per task (old). */
+void spu_channels_thread_reset(void);
+void spu_drain_thread_reset(void);
+void spurs_job_thread_reset(void);
+void spurs_policy_thread_reset(void);
+
+static void spu_thread_job_reset(void)
+{
+    spu_channels_thread_reset();
+    spu_drain_thread_reset();
+    spurs_job_thread_reset();
+    spurs_policy_thread_reset();
+    s_ts_held = 0;
+}
+
+typedef struct spu_pool_worker {
+    HANDLE wake;                    /* auto-reset: a job was handed over */
+    spu_async_job* job;
+    struct spu_pool_worker* next;   /* idle list */
+} spu_pool_worker;
+
+static SRWLOCK s_pool_lock = SRWLOCK_INIT;
+static spu_pool_worker* s_pool_idle;
+static unsigned s_pool_idle_n;
+static volatile LONG64 s_pool_created, s_pool_reused;
+
+static int spu_pool_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_POOL"); on = !(e && e[0] == '0'); }
+    return on;
+}
+
+static unsigned spu_pool_max_idle(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char* e = getenv("SPU_POOL_IDLE");
+        n = e ? atoi(e) : 16;
+        if (n < 0) n = 0;
+        if (n > 256) n = 256;
+    }
+    return (unsigned)n;
+}
+
+/* Threads created / tasks handed to a parked thread, since start. */
+void spu_pool_stats(long long* created, long long* reused)
+{
+    if (created) *created = InterlockedCompareExchange64(&s_pool_created, 0, 0);
+    if (reused) *reused = InterlockedCompareExchange64(&s_pool_reused, 0, 0);
+}
+
+static DWORD WINAPI spu_pool_thread(LPVOID p)
+{
+    spu_pool_worker* w = (spu_pool_worker*)p;
+    ps3_thread_name("spu job");
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    ULONG_PTR lo, hi;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    for (;;) {
+        spu_async_job* j = w->job;
+        w->job = NULL;
+        spu_async_run(j);   /* frees j */
+        { extern void spu_coh_forget_range(uintptr_t, uintptr_t);
+          spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
+          spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
+        spu_thread_job_reset();
+        AcquireSRWLockExclusive(&s_pool_lock);
+        if (s_pool_idle_n >= spu_pool_max_idle()) {
+            ReleaseSRWLockExclusive(&s_pool_lock);
+            break;
+        }
+        w->next = s_pool_idle;
+        s_pool_idle = w;
+        s_pool_idle_n++;
+        ReleaseSRWLockExclusive(&s_pool_lock);
+        WaitForSingleObject(w->wake, INFINITE);   /* job set before SetEvent */
+    }
+    CloseHandle(w->wake);
+    free(w);
+    return 0;
+}
+
+/* 1 = the job runs on a pooled thread (parked or new); 0 = not taken. */
+static int spu_pool_dispatch(spu_async_job* j)
+{
+    if (!spu_pool_enabled() || j->image_id == 22)
+        return 0;
+    AcquireSRWLockExclusive(&s_pool_lock);
+    spu_pool_worker* w = s_pool_idle;
+    if (w) {
+        s_pool_idle = w->next;
+        s_pool_idle_n--;
+    }
+    ReleaseSRWLockExclusive(&s_pool_lock);
+    if (w) {
+        w->job = j;
+        InterlockedIncrement64(&s_pool_reused);
+        SetEvent(w->wake);
+        return 1;
+    }
+    w = (spu_pool_worker*)calloc(1, sizeof(*w));
+    if (!w)
+        return 0;
+    w->wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!w->wake) { free(w); return 0; }
+    w->job = j;
+    /* Same 256 MB stack reservation as spu_workload_dispatch_async. */
+    HANDLE th = CreateThread(NULL, 256u << 20, spu_pool_thread, w,
+                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!th) { CloseHandle(w->wake); free(w); return 0; }
+    CloseHandle(th);   /* detached */
+    InterlockedIncrement64(&s_pool_created);
+    return 1;
+}
+#endif
+
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size)
 {
@@ -1741,6 +1876,8 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * chains are deep host call chains with fat lifted frames -- a 1MB stack
      * blew the guard page (STATUS_GUARD_PAGE_VIOLATION 0x80000001, silent
      * process death) the moment the real decode path first executed. */
+    if (spu_pool_dispatch(j))
+        return 1;
     HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!th) { free(j); return 0; }

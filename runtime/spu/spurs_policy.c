@@ -39,6 +39,13 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
 SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
 SPU_THREAD_LOCAL volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
+/* Pooled SPU job thread: back to a new thread's state (spu_workload.c). */
+void spurs_policy_thread_reset(void)
+{
+    g_spurs_pm_polls = 0;
+    g_spurs_pm_exited = 0;
+    g_wws_batch_gets = 0;
+}
 
 /* Contexts are resident per (instance, workload, physical SPU). Workload IDs
  * from different instances must never share local store or pipeline state.
