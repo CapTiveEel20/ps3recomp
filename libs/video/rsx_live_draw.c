@@ -6409,6 +6409,7 @@ static ID3D12Resource* g_vc_ib;
 static u8* g_vc_vb_mapped;
 static u8* g_vc_ib_mapped;
 static int g_vc_on;   /* arena created and LD_VCACHE != 0 */
+static int g_vc_sweep = 1;   /* LD_VCACHE_SWEEP=0: store at first sight, reset when full */
 
 typedef struct ld_vc_draw {
     rsx_vcache_action action;
@@ -6535,7 +6536,17 @@ static void ld_vc_begin(u32 prim, const rsx_vertex_layout_plan* layout,
     }
     rsx_vcache_entry* entry =
         rsx_vcache_lookup(&g_vc, ld_vc_identity(prim, layout));
+    /* Noted before the backoff gate, so a volatile draw still counts as used. */
+    const int seen_before = rsx_vcache_entry_seen(entry, g_ld_frames);
     if (!entry || rsx_vcache_entry_skipped(&g_vc, entry, g_ld_frames)) {
+        ld_vc_bypass();
+        return;
+    }
+    /* First sighting of this identity: convert as usual, store nothing. Most
+     * such draws never come back (the title writes that geometry at a new
+     * address every frame); the ones that do are stored next time. */
+    if (!seen_before && g_vc_sweep) {
+        g_vc.stats.first_seen++;
         ld_vc_bypass();
         return;
     }
@@ -6582,7 +6593,7 @@ static void ld_vc_note_ranges(void)
 static void ld_wait_submitted(void);
 static void ld_vc_frame_end(void)
 {
-    if (!g_vc_on || !g_vc.full)
+    if (!g_vc_on || !rsx_vcache_frame_end(&g_vc, g_ld_frames, g_vc_sweep))
         return;
     ld_wait_submitted();   /* no-op for the synchronous present */
     rsx_vcache_reset(&g_vc);
@@ -6627,8 +6638,11 @@ static void ld_vc_create(void)
     if (SUCCEEDED(hr) &&
         rsx_vcache_init(&g_vc, 32768, vb_mb << 20, ib_mb << 20)) {
         g_vc_on = 1;
-        fprintf(stderr, "[vcache] on: arena vb %u MB ib %u MB, %u slots\n",
-                vb_mb, ib_mb, g_vc.slot_capacity);
+        const char* sw = getenv("LD_VCACHE_SWEEP");
+        g_vc_sweep = !(sw && sw[0] == '0');
+        fprintf(stderr, "[vcache] on: arena vb %u MB ib %u MB, %u slots, %s\n",
+                vb_mb, ib_mb, g_vc.slot_capacity,
+                g_vc_sweep ? "stale entries swept" : "reset when full (LD_VCACHE_SWEEP=0)");
         return;
     }
     fprintf(stderr, "[vcache] off: arena allocation failed hr=0x%08lX\n",
@@ -12088,17 +12102,20 @@ void rsx_live_draw_present(u32 buffer_id)
                 fprintf(stderr,
                         "[vcache] per frame: hit %.0f fill %.0f changed %.1f volatile %.0f bypass %.0f"
                         " | hashed %.1f MB filled %.2f MB | arena vb %u/%u MB ib %u/%u MB"
-                        " slots %u | resets %llu\n",
+                        " slots %u | resets %llu | new %.0f sweeps %llu evicted %llu\n",
                         s->hits / frames, s->fills / frames, s->changed / frames,
                         s->volatile_skips / frames, s->bypass / frames,
                         s->hashed_bytes / frames / 1048576.0,
                         s->filled_bytes / frames / 1048576.0,
                         g_vc.vb_used >> 20, g_vc.vb_capacity >> 20,
                         g_vc.ib_used >> 20, g_vc.ib_capacity >> 20,
-                        g_vc.slot_used, (unsigned long long)s->resets);
-                const u64 resets = s->resets;
+                        g_vc.slot_used, (unsigned long long)s->resets,
+                        s->first_seen / frames, (unsigned long long)s->sweeps,
+                        (unsigned long long)s->evicted);
+                const u64 resets = s->resets, sweeps = s->sweeps;
                 memset(&g_vc.stats, 0, sizeof(g_vc.stats));
                 g_vc.stats.resets = resets;
+                g_vc.stats.sweeps = sweeps;
             } }
           fps_t0 = now; fps_f0 = g_ld_frames;
       } }

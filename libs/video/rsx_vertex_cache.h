@@ -50,6 +50,7 @@ typedef struct rsx_vcache_entry {
     u32 vertex_count;        /* converted vertices in the arena */
     u32 source_refs;
     u32 retry_frame;         /* volatile/uncacheable: bypass before this frame */
+    u32 last_frame;          /* frame + 1 of the last sighting; 0 = never seen */
     u8  indexed;
     u8  n_ranges;
     u8  streak;              /* consecutive content changes */
@@ -59,17 +60,19 @@ typedef struct rsx_vcache_entry {
 
 typedef struct rsx_vcache_stats {
     u64 hits, fills, changed, volatile_skips, bypass, hashed_bytes,
-        filled_bytes, resets;
+        filled_bytes, resets, first_seen, sweeps, evicted;
 } rsx_vcache_stats;
 
 typedef struct rsx_vcache {
     rsx_vcache_entry* slots;
+    rsx_vcache_entry* spare;   /* second table, swapped in by rsx_vcache_sweep */
     u32 slot_capacity;       /* power of two */
     u32 slot_used;
     u32 generation;          /* starts at 1 */
     u32 vb_capacity, ib_capacity;
     u32 vb_used, ib_used;
-    int full;                /* arena/table full: reset at the next GPU-idle point */
+    int full;                /* arena/table full: sweep or reset at the next frame end */
+    int arena_full;          /* the arena ran out: only a reset frees it */
     rsx_vcache_stats stats;
 } rsx_vcache;
 
@@ -93,6 +96,28 @@ int  rsx_vcache_reset_if_full(rsx_vcache* cache);
 /* Entry for `identity` (never 0), created if absent and the table is below
  * 3/4 load; NULL when it cannot be created (the cache then asks for a reset). */
 rsx_vcache_entry* rsx_vcache_lookup(rsx_vcache* cache, u64 identity);
+
+/* Record that `entry`'s draw was issued in `frame`. Returns 1 when it had been
+ * seen before. A draw whose identity never repeats (geometry the title writes
+ * at a new address every frame) would fill the arena and the table with
+ * entries nothing ever hits, so the renderer stores a draw only from its
+ * second sighting on. */
+int rsx_vcache_entry_seen(rsx_vcache_entry* entry, u32 frame);
+
+/* Drop table entries nothing used lately, keeping every other entry and all
+ * arena data (so no GPU-idle point is needed, only that the caller holds no
+ * entry pointer). Kept: entries with arena data seen within `keep_filled`
+ * frames, entries still in a volatile/uncacheable backoff, and other entries
+ * seen within `keep_other` frames. Clears the table-full request. Returns the
+ * number of entries dropped. */
+u32 rsx_vcache_sweep(rsx_vcache* cache, u32 frame, u32 keep_filled, u32 keep_other);
+
+/* Frame-end housekeeping. Sweeps when the table is over half full (or asked
+ * for room), first gently, then down to the entries of the last two frames.
+ * Returns 1 when only a full reset helps (arena full, or the table is still
+ * over half full after sweeping): the caller waits for the GPU and calls
+ * rsx_vcache_reset. sweep_enabled = 0 keeps the old reset-only behaviour. */
+int rsx_vcache_frame_end(rsx_vcache* cache, u32 frame, int sweep_enabled);
 
 /* Sort by (location, offset) and merge overlapping or touching ranges of one
  * location in place. Returns the new count. */

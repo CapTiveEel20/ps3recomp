@@ -297,8 +297,121 @@ static void test_arena(void)
     rsx_vcache_destroy(&c);
 }
 
+/* Fill an entry the way the renderer does after a FILL decision. */
+static void fill_entry(rsx_vcache* c, rsx_vcache_entry* e, u64 tag)
+{
+    const rsx_vcache_range r = { 0, (u32)tag * 64u, 32 };
+    u32 vo = 0, io = 0;
+    CHECK(rsx_vcache_alloc(c, 64, 16, &vo, &io), "alloc for fill");
+    rsx_vcache_commit(c, e, tag, tag + 1, &r, 1, vo, 64, io, 16, 6, 4, 6, 1);
+}
+
+static void test_seen(void)
+{
+    rsx_vcache c;
+    CHECK(rsx_vcache_init(&c, 64, 1 << 20, 1 << 20), "init");
+    rsx_vcache_entry* e = rsx_vcache_lookup(&c, 5);
+    CHECK(!rsx_vcache_entry_seen(e, 0), "first sighting (frame 0) reports unseen");
+    CHECK(rsx_vcache_entry_seen(e, 0), "second sighting in the same frame is seen");
+    CHECK(rsx_vcache_entry_seen(e, 9), "later frame is seen");
+    rsx_vcache_entry* w = rsx_vcache_lookup(&c, 6);
+    CHECK(!rsx_vcache_entry_seen(w, UINT32_MAX), "frame wrap: unseen");
+    CHECK(rsx_vcache_entry_seen(w, 0), "frame wrap: still recorded as seen");
+    CHECK(!rsx_vcache_entry_seen(NULL, 1), "NULL entry");
+    rsx_vcache_destroy(&c);
+}
+
+static void test_sweep(void)
+{
+    rsx_vcache c;
+    CHECK(rsx_vcache_init(&c, 1024, 1 << 20, 1 << 20), "init");
+    /* 100 stable draws, stored, seen every frame. */
+    enum { STABLE = 100 };
+    for (u32 i = 0; i < STABLE; i++) {
+        rsx_vcache_entry* e = rsx_vcache_lookup(&c, 0x5000 + i);
+        rsx_vcache_entry_seen(e, 0);
+        fill_entry(&c, e, 0x5000 + i);
+    }
+    /* One volatile draw in a long backoff, one stored draw not seen lately. */
+    rsx_vcache_entry* vol = rsx_vcache_lookup(&c, 0x7001);
+    rsx_vcache_entry_seen(vol, 0);
+    rsx_vcache_entry_defer(vol, 0, 100000);
+    rsx_vcache_entry* old = rsx_vcache_lookup(&c, 0x7002);
+    rsx_vcache_entry_seen(old, 0);
+    fill_entry(&c, old, 0x7002);
+    const u32 vb_before = c.vb_used, gen = c.generation;
+
+    /* 4000 frames; 20 never-repeating identities each. */
+    u32 frame = 0, oneoff = 0, resets_wanted = 0, lookups_failed = 0, max_used = 0;
+    for (frame = 1; frame <= 4000; frame++) {
+        for (u32 i = 0; i < STABLE; i++) {
+            rsx_vcache_entry* e = rsx_vcache_lookup(&c, 0x5000 + i);
+            if (!e) { lookups_failed++; continue; }
+            CHECK(rsx_vcache_entry_seen(e, frame), "frame %u: stable draw %u lost its history", frame, i);
+            CHECK(rsx_vcache_decide(&c, e, frame, 0x5000 + i, 1, 0x5001 + i) == RSX_VCACHE_HIT,
+                  "frame %u: stable draw %u no longer hits", frame, i);
+            CHECK(e->vb_offset == i * 256u && e->vb_bytes == 64, "frame %u: draw %u arena slot moved", frame, i);
+        }
+        for (u32 i = 0; i < 20; i++) {
+            rsx_vcache_entry* e = rsx_vcache_lookup(&c, 0x100000ull + oneoff++);
+            if (!e) { lookups_failed++; continue; }
+            CHECK(!rsx_vcache_entry_seen(e, frame), "one-off identity reported as seen");
+        }
+        if (c.slot_used > max_used) max_used = c.slot_used;
+        if (rsx_vcache_frame_end(&c, frame, 1)) { resets_wanted++; rsx_vcache_reset(&c); }
+    }
+    CHECK(resets_wanted == 0 && c.stats.resets == 0, "sweeping must avoid resets (wanted %u)", resets_wanted);
+    CHECK(lookups_failed == 0, "%u lookups failed", lookups_failed);
+    CHECK(c.stats.sweeps > 50 && c.stats.evicted > 70000, "sweeps %llu evicted %llu",
+          (unsigned long long)c.stats.sweeps, (unsigned long long)c.stats.evicted);
+    CHECK(max_used <= 1024 / 2 + 20 + 2, "table grew to %u of 1024", max_used);
+    CHECK(c.vb_used == vb_before && c.generation == gen, "sweep must not touch the arena");
+    CHECK(rsx_vcache_lookup(&c, 0x7001)->retry_frame == 100000, "volatile backoff survived");
+    CHECK(rsx_vcache_lookup(&c, 0x7002)->generation == 0, "stored draw unseen for 3000+ frames dropped");
+    u32 found = 0;
+    for (u32 i = 0; i < c.slot_capacity; i++) found += c.slots[i].identity != 0;
+    CHECK(found == c.slot_used, "slot_used %u but %u entries in table", c.slot_used, found);
+    for (u32 i = 0; i < c.slot_capacity; i++) CHECK(c.spare[i].identity == 0, "spare table not clean at %u", i);
+    printf("sweep: %llu sweeps, %llu evicted, table peak %u/1024, 0 resets\n",
+           (unsigned long long)c.stats.sweeps, (unsigned long long)c.stats.evicted, max_used);
+
+    /* Old behaviour (sweep off): same load must ask for resets. */
+    rsx_vcache o;
+    CHECK(rsx_vcache_init(&o, 1024, 1 << 20, 1 << 20), "init");
+    u32 old_resets = 0;
+    for (frame = 1, oneoff = 0; frame <= 400; frame++) {
+        for (u32 i = 0; i < 20; i++) rsx_vcache_lookup(&o, 0x100000ull + oneoff++);
+        if (rsx_vcache_frame_end(&o, frame, 0)) { old_resets++; rsx_vcache_reset(&o); }
+    }
+    CHECK(old_resets >= 9 && o.stats.sweeps == 0, "sweep off: %u resets, %llu sweeps", old_resets,
+          (unsigned long long)o.stats.sweeps);
+    rsx_vcache_destroy(&o);
+
+    /* Too many live draws for the table: must fall back to a reset. */
+    rsx_vcache_reset(&c);
+    for (u32 i = 0; i < 2000; i++) {
+        rsx_vcache_entry* e = rsx_vcache_lookup(&c, 0x900000ull + i);
+        if (e) rsx_vcache_entry_seen(e, 5000);
+    }
+    CHECK(c.full && rsx_vcache_frame_end(&c, 5000, 1), "overfull table of live draws asks for a reset");
+
+    /* Arena full: a sweep cannot help. */
+    rsx_vcache_reset(&c);
+    u32 vo, io;
+    CHECK(!rsx_vcache_alloc(&c, 2 << 20, 16, &vo, &io) && c.arena_full, "arena overflow flagged");
+    CHECK(rsx_vcache_frame_end(&c, 5001, 1) && c.stats.sweeps > 0, "arena full asks for a reset");
+    const u64 sweeps = c.stats.sweeps;
+    rsx_vcache_frame_end(&c, 5001, 1);
+    CHECK(c.stats.sweeps == sweeps, "no sweep attempted for a full arena");
+    rsx_vcache_reset(&c);
+    CHECK(!c.full && !c.arena_full, "reset clears both requests");
+    rsx_vcache_destroy(&c);
+}
+
 int main(void)
 {
+    test_seen();
+    test_sweep();
     test_merge();
     test_table();
     test_policy();

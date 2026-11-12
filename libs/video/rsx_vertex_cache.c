@@ -22,6 +22,12 @@ int rsx_vcache_init(rsx_vcache* cache, u32 slot_capacity,
     cache->slots = (rsx_vcache_entry*)calloc(capacity, sizeof(rsx_vcache_entry));
     if (!cache->slots)
         return 0;
+    cache->spare = (rsx_vcache_entry*)calloc(capacity, sizeof(rsx_vcache_entry));
+    if (!cache->spare) {
+        free(cache->slots);
+        cache->slots = NULL;
+        return 0;
+    }
     cache->slot_capacity = capacity;
     cache->generation = 1;
     cache->vb_capacity = vb_capacity;
@@ -34,6 +40,7 @@ void rsx_vcache_destroy(rsx_vcache* cache)
     if (!cache)
         return;
     free(cache->slots);
+    free(cache->spare);
     memset(cache, 0, sizeof(*cache));
 }
 
@@ -48,6 +55,7 @@ void rsx_vcache_reset(rsx_vcache* cache)
     cache->vb_used = 0;
     cache->ib_used = 0;
     cache->full = 0;
+    cache->arena_full = 0;
     cache->stats.resets++;
 }
 
@@ -85,6 +93,70 @@ rsx_vcache_entry* rsx_vcache_lookup(rsx_vcache* cache, u64 identity)
     }
     cache->full = 1;
     return NULL;
+}
+
+int rsx_vcache_entry_seen(rsx_vcache_entry* entry, u32 frame)
+{
+    if (!entry)
+        return 0;
+    const u32 before = entry->last_frame;
+    entry->last_frame = frame + 1u ? frame + 1u : 1u;
+    return before != 0;
+}
+
+static int rsx_vcache_entry_valid(const rsx_vcache* cache,
+                                  const rsx_vcache_entry* entry);
+
+u32 rsx_vcache_sweep(rsx_vcache* cache, u32 frame, u32 keep_filled, u32 keep_other)
+{
+    if (!cache || !cache->slots || !cache->spare)
+        return 0;
+    const u32 mask = cache->slot_capacity - 1u;
+    rsx_vcache_entry* to = cache->spare;   /* all zero: see below */
+    u32 kept = 0;
+    for (u32 i = 0; i < cache->slot_capacity; i++) {
+        const rsx_vcache_entry* entry = &cache->slots[i];
+        if (!entry->identity)
+            continue;
+        /* Frames since the last sighting; never seen counts as very old. */
+        const u32 age = entry->last_frame ? frame + 1u - entry->last_frame : UINT32_MAX;
+        const u32 keep = rsx_vcache_entry_valid(cache, entry) ? keep_filled : keep_other;
+        const int backing_off = entry->retry_frame - frame - 1u < 0x7FFFFFFFu;   /* retry_frame > frame */
+        if (age > keep && !backing_off)
+            continue;
+        u32 at = (u32)(entry->identity ^ (entry->identity >> 29) ^
+                       (entry->identity >> 47)) & mask;
+        while (to[at].identity)
+            at = (at + 1u) & mask;
+        to[at] = *entry;
+        kept++;
+    }
+    const u32 dropped = cache->slot_used - kept;
+    memset(cache->slots, 0, (size_t)cache->slot_capacity * sizeof(rsx_vcache_entry));
+    cache->spare = cache->slots;   /* zeroed, ready for the next sweep */
+    cache->slots = to;
+    cache->slot_used = kept;
+    if (!cache->arena_full)
+        cache->full = 0;
+    cache->stats.sweeps++;
+    cache->stats.evicted += dropped;
+    return dropped;
+}
+
+int rsx_vcache_frame_end(rsx_vcache* cache, u32 frame, int sweep_enabled)
+{
+    if (!cache || !cache->slots)
+        return 0;
+    if (!sweep_enabled || cache->arena_full)
+        return cache->full != 0;
+    if (!cache->full && (u64)cache->slot_used * 2u <= cache->slot_capacity)
+        return 0;
+    rsx_vcache_sweep(cache, frame, 3000u, 8u);
+    if ((u64)cache->slot_used * 2u > cache->slot_capacity)
+        rsx_vcache_sweep(cache, frame, 1u, 1u);
+    if ((u64)cache->slot_used * 2u > cache->slot_capacity)
+        cache->full = 1;   /* that many draws in two frames: start over */
+    return cache->full != 0;
 }
 
 static int rsx_vcache_range_less(const rsx_vcache_range* a,
@@ -255,6 +327,7 @@ int rsx_vcache_alloc(rsx_vcache* cache, u32 vb_bytes, u32 ib_bytes,
     if (!rsx_vcache_take(&vb_used, cache->vb_capacity, vb_bytes, vb_offset) ||
         !rsx_vcache_take(&ib_used, cache->ib_capacity, ib_bytes, ib_offset)) {
         cache->full = 1;
+        cache->arena_full = 1;
         return 0;
     }
     cache->vb_used = vb_used;
