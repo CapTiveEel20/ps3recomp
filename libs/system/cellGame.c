@@ -509,8 +509,9 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
  * stalls, and the cellSaveDataAutoLoad2 (auto-save notice) dialog never appears.
  *
  * funcStat(cbResult, get, set): the title reads `get` (isNewData, free space, params)
- * and writes cbResult->result. We report existing data (isNewData=0) + ample space;
- * DeS's callback returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
+ * and writes cbResult->result. We report isNewData from the host directory + ample
+ * space; DeS's callback returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK.
+ * New data: the USRDIR is created after OK / OK_CANCEL (see cellGameDataCheckCreate2). */
 #define GAMEDATA_CB_BASE   0x02520000u   /* guest scratch (distinct from savedata's) */
 #define CELL_GAMEDATA_CBRESULT_OK_CANCEL  1
 #define CELL_GAMEDATA_CBRESULT_OK         0
@@ -543,7 +544,7 @@ static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
 
     /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
     vm_write32(get + 0x000, (u32)content_free_kb_reported());
-    vm_write32(get + 0x004, is_new_data);                            /* isNewData = 0 (data exists) */
+    vm_write32(get + 0x004, is_new_data);                            /* isNewData (1 = new) */
     snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
     snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */
     vm_write32(get + 0xB9C, 0xFFFFFFFFu);                  /* sizeKB = NOTCALC (-1) */
@@ -574,13 +575,33 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
     if (version != 0 || !dir_ea || !func_opd)
         return CELL_GAME_ERROR_PARAM;
 
-    /* We report existing data (isNewData=0) + ample space; DeS's callback
-     * returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
+    /* The directory name becomes a host path under content_root(): refuse
+     * anything that could step outside it (real names look like BLES00238). */
+    const char* dir = (const char*)(vm_base + dir_ea);
+    if (!dir[0] || !strcmp(dir, ".") || !strcmp(dir, "..") ||
+        strpbrk(dir, "/\\:") || strlen(dir) >= 64)
+        return CELL_GAME_ERROR_PARAM;
+
+    /* isNewData from the host directory the VFS maps /dev_hdd0/game/<dir> to. */
+    char host_usrdir[CELL_GAME_PATH_MAX];
+    snprintf(host_usrdir, sizeof host_usrdir, "%s/%s/USRDIR", content_root(), dir);
+    const u32 is_new = dir_exists(host_usrdir) ? 0u : 1u;
+
     s32 result = gamedata_stat_callback("DataCheckCreate2", version, dir_ea,
-                                        func_opd, 0);
+                                        func_opd, is_new);
     if (result < 0)
         return CELL_GAME_ERROR_PARAM;   /* callback reported an error */
-    /* OK / OK_CANCEL: succeed (our HLE doesn't create/modify the on-disk data). */
+
+    /* OK and OK_CANCEL both leave the title with a usable game-data directory:
+     * the firmware creates /dev_hdd0/game/<dir>/USRDIR for new data. Civilization
+     * Revolution always answers OK_CANCEL and then copies its .FPK files from the
+     * disc into that USRDIR; without the directory every copy failed on a fresh
+     * install. RPCS3 leaves the same title with dev_hdd0/game/BLES00238/USRDIR. */
+    if (is_new) {
+        ensure_dirs(host_usrdir);
+        printf("[cellGame] DataCheckCreate2: created %s (%s)\n", host_usrdir,
+               dir_exists(host_usrdir) ? "ok" : "FAILED");
+    }
     return CELL_OK;
 }
 
