@@ -80,6 +80,7 @@ static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_sur
 static volatile long g_ld_ps1_vram_ready = 0;
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_compact.h"
+#include "rsx_vertex_cache.h"
 #include "rsx_vp_decompiler.h"
 
 #include <ctype.h>
@@ -6384,6 +6385,268 @@ static int ld_arrays_disjoint(void)
     return 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Converted-vertex cache (rsx_vertex_cache.h).
+ *
+ * A draw whose identity (formats, offsets, strides, constant attributes,
+ * index buffer and batches, primitive) and guest content (index bytes, the
+ * vertex byte ranges its conversion reads) match a stored entry binds that
+ * entry's converted vertices and triangle-list indices from a GPU arena and
+ * skips index decode, conversion, topology and the ring memcpy. A miss
+ * converts as before, into the arena. Content hashes are taken BEFORE the
+ * conversion reads the bytes, so a guest write racing the conversion can only
+ * make the next frame re-convert, never keep stale geometry.
+ *
+ * The arena is never overwritten while the GPU may read it: allocation only
+ * moves forward, and a full arena is reset at present, after the frame's
+ * fence wait (ld_vc_frame_end). LD_VCACHE=0 = old path (no arena allocated).
+ * LD_VCACHE_VB_MB / LD_VCACHE_IB_MB: arena sizes (default 256 / 64).
+ * Per [fps] window: [vcache] hits/fills/bypasses and bytes.
+ * -----------------------------------------------------------------------*/
+static rsx_vcache g_vc;
+static ID3D12Resource* g_vc_vb;
+static ID3D12Resource* g_vc_ib;
+static u8* g_vc_vb_mapped;
+static u8* g_vc_ib_mapped;
+static int g_vc_on;   /* arena created and LD_VCACHE != 0 */
+
+typedef struct ld_vc_draw {
+    rsx_vcache_action action;
+    rsx_vcache_entry* entry;
+    u64 index_hash;
+    u64 vertex_hash;
+    rsx_vcache_range ranges[RSX_VCACHE_MAX_RANGES];
+    u32 n_ranges;
+} ld_vc_draw;
+static ld_vc_draw g_vcd;   /* the draw in sink_end_impl (ticker thread only) */
+
+static u64 ld_vc_mix(u64 h, u64 v)
+{
+    return (h ^ v) * 1099511628211ull;
+}
+
+/* Everything that decides which guest bytes are read and how they convert,
+ * apart from the bytes themselves. */
+static u64 ld_vc_identity(u32 prim, const rsx_vertex_layout_plan* layout)
+{
+    u32 key[16 + RSX_DSP_NUM_VERTEX_ATTR * 11];   /* 13 + 11 per slot */
+    u32 n = 0;
+    rsx_dsp_index_array index_array;
+    rsx_dsp_get_index_array(&g.rsx, &index_array);
+    static int no_restart = -1;
+    if (no_restart < 0)
+        no_restart = getenv("RSX_NO_RESTART") ? 1 : 0;
+    key[n++] = prim;
+    key[n++] = layout->mask;
+    key[n++] = rsx_dsp_vertex_data_base_offset(&g.rsx);
+    key[n++] = rsx_dsp_vertex_data_base_index(&g.rsx);
+    key[n++] = rsx_dsp_reg(&g.rsx, 0x1FC0);   /* frequency divider modes */
+    key[n++] = !no_restart &&
+               rsx_dsp_restart_index_enabled(&g.rsx, index_array.is_u32);
+    key[n++] = rsx_dsp_restart_index(&g.rsx);
+    key[n++] = index_array.offset;
+    key[n++] = index_array.location;
+    key[n++] = index_array.is_u32;
+    key[n++] = dc.n_arr;
+    key[n++] = dc.n_idx;
+    key[n++] = dc.n_elem;
+    for (u32 slot = 0; slot < layout->count; slot++) {
+        const u32 attr = layout->attrs[slot];
+        rsx_dsp_vertex_attr desc;
+        rsx_dsp_get_vertex_attr(&g.rsx, attr, &desc);
+        float value[4];
+        rsx_vertex_fetch_default(&g.rsx, attr, value);
+        key[n++] = attr;
+        key[n++] = desc.type;
+        key[n++] = desc.size;
+        key[n++] = desc.stride;
+        key[n++] = desc.frequency;
+        key[n++] = desc.offset;
+        key[n++] = desc.location;
+        memcpy(&key[n], value, sizeof(value));
+        n += 4;
+    }
+    u64 h = rsx_mutation_hash((const u8*)key, n * 4u);
+    if (dc.n_arr)
+        h = ld_vc_mix(h, rsx_mutation_hash((const u8*)dc.arr,
+                                           dc.n_arr * (u32)sizeof(batch_t)));
+    if (dc.n_idx)
+        h = ld_vc_mix(h, rsx_mutation_hash((const u8*)dc.idx,
+                                           dc.n_idx * (u32)sizeof(batch_t)));
+    return h ? h : 1;
+}
+
+/* Raw index bytes and inline element indices. 0 when a batch is unmapped. */
+static int ld_vc_index_hash(u64* out)
+{
+    u64 h = 0x5EED1DEAull;
+    if (dc.n_idx) {
+        rsx_dsp_index_array index_array;
+        rsx_dsp_get_index_array(&g.rsx, &index_array);
+        const u32 element_size = index_array.is_u32 ? 4u : 2u;
+        for (u32 batch = 0; batch < dc.n_idx; batch++) {
+            const u32 count = dc.idx[batch].count;
+            if (!count) continue;
+            const u64 start64 = (u64)index_array.offset +
+                                (u64)dc.idx[batch].first * element_size;
+            const u64 bytes64 = (u64)count * element_size;
+            if (start64 + bytes64 > 0x100000000ull)
+                return 0;
+            const u8* source = guest_ptr(index_array.location, (u32)start64,
+                                         (u32)bytes64);
+            if (!source)
+                return 0;
+            h = ld_vc_mix(h, rsx_mutation_hash(source, (u32)bytes64));
+            g_vc.stats.hashed_bytes += bytes64;
+        }
+    }
+    if (dc.n_elem) {
+        h = ld_vc_mix(h, rsx_mutation_hash((const u8*)dc.elem, dc.n_elem * 4u));
+        g_vc.stats.hashed_bytes += (u64)dc.n_elem * 4u;
+    }
+    *out = h;
+    return 1;
+}
+
+static void ld_vc_bypass(void)
+{
+    g_vcd.action = RSX_VCACHE_BYPASS;
+    g_vc.stats.bypass++;
+}
+
+/* Decide HIT / FILL / BYPASS for the draw about to be converted. */
+static void ld_vc_begin(u32 prim, const rsx_vertex_layout_plan* layout,
+                        int movie_mode)
+{
+    g_vcd.action = RSX_VCACHE_BYPASS;
+    g_vcd.entry = NULL;
+    g_vcd.n_ranges = 0;
+    if (!g_vc_on)
+        return;
+    static int csv = -1;
+    if (csv < 0)
+        csv = getenv("RSX_DRAW_CSV") ? 1 : 0;
+    /* Inline vertices live in the FIFO; capture/CSV fingerprints and movie
+     * composition read the freshly converted vertices. */
+    if (dc.inl || movie_mode || s_cap_file || csv ||
+        !ld_vertex_compact_payload() || !layout->count) {
+        ld_vc_bypass();
+        return;
+    }
+    rsx_vcache_entry* entry =
+        rsx_vcache_lookup(&g_vc, ld_vc_identity(prim, layout));
+    if (!entry || rsx_vcache_entry_skipped(&g_vc, entry, g_ld_frames)) {
+        ld_vc_bypass();
+        return;
+    }
+    u64 index_hash = 0;
+    if (!ld_vc_index_hash(&index_hash)) {
+        rsx_vcache_entry_defer(entry, g_ld_frames, 600);
+        ld_vc_bypass();
+        return;
+    }
+    int vertex_ok = 0;
+    u64 vertex_hash = 0;
+    if (rsx_vcache_entry_wants_vertex_hash(&g_vc, entry, index_hash))
+        vertex_ok = rsx_vcache_hash_ranges(
+            entry->ranges, entry->n_ranges,
+            (rsx_vertex_guest_ptr_fn)g.guest_ptr, g.guest_user,
+            &vertex_hash, &g_vc.stats.hashed_bytes);
+    g_vcd.entry = entry;
+    g_vcd.index_hash = index_hash;
+    g_vcd.action = rsx_vcache_decide(&g_vc, entry, g_ld_frames, index_hash,
+                                     vertex_ok, vertex_hash);
+    if (g_vcd.action == RSX_VCACHE_BYPASS)
+        g_vc.stats.bypass++;
+}
+
+/* FILL: called between rsx_vertex_fetch_plan_prepare and the conversion, so
+ * the hash is never newer than the bytes converted. */
+static void ld_vc_note_ranges(void)
+{
+    if (g_vcd.action != RSX_VCACHE_FILL)
+        return;
+    g_vcd.n_ranges = rsx_vcache_ranges_from_plan(&dc.fetch_plan, g_vcd.ranges);
+    if (!g_vcd.n_ranges ||
+        !rsx_vcache_hash_ranges(g_vcd.ranges, g_vcd.n_ranges,
+                                (rsx_vertex_guest_ptr_fn)g.guest_ptr,
+                                g.guest_user, &g_vcd.vertex_hash,
+                                &g_vc.stats.hashed_bytes)) {
+        g_vcd.n_ranges = 0;
+        rsx_vcache_entry_defer(g_vcd.entry, g_ld_frames, 600);
+        ld_vc_bypass();
+    }
+}
+
+/* Present, after the frame's fence: the GPU reads no arena data any more. */
+static void ld_wait_submitted(void);
+static void ld_vc_frame_end(void)
+{
+    if (!g_vc_on || !g_vc.full)
+        return;
+    ld_wait_submitted();   /* no-op for the synchronous present */
+    rsx_vcache_reset(&g_vc);
+}
+
+static void ld_vc_create(void)
+{
+    g_vc_on = 0;
+    const char* e = getenv("LD_VCACHE");
+    if (e && e[0] == '0')
+        return;
+    const char* vb_env = getenv("LD_VCACHE_VB_MB");
+    const char* ib_env = getenv("LD_VCACHE_IB_MB");
+    u32 vb_mb = vb_env ? (u32)atoi(vb_env) : 256u;
+    u32 ib_mb = ib_env ? (u32)atoi(ib_env) : 64u;
+    if (vb_mb < 16 || vb_mb > 2048) vb_mb = 256;
+    if (ib_mb < 4 || ib_mb > 2048) ib_mb = 64;
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_RANGE none = {0, 0};
+    bd.Width = (u64)vb_mb << 20;
+    HRESULT hr = g.dev->lpVtbl->CreateCommittedResource(
+        g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
+        (void**)&g_vc_vb);
+    if (SUCCEEDED(hr))
+        hr = g_vc_vb->lpVtbl->Map(g_vc_vb, 0, &none, (void**)&g_vc_vb_mapped);
+    if (SUCCEEDED(hr)) {
+        bd.Width = (u64)ib_mb << 20;
+        hr = g.dev->lpVtbl->CreateCommittedResource(
+            g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
+            (void**)&g_vc_ib);
+    }
+    if (SUCCEEDED(hr))
+        hr = g_vc_ib->lpVtbl->Map(g_vc_ib, 0, &none, (void**)&g_vc_ib_mapped);
+    if (SUCCEEDED(hr) &&
+        rsx_vcache_init(&g_vc, 32768, vb_mb << 20, ib_mb << 20)) {
+        g_vc_on = 1;
+        fprintf(stderr, "[vcache] on: arena vb %u MB ib %u MB, %u slots\n",
+                vb_mb, ib_mb, g_vc.slot_capacity);
+        return;
+    }
+    fprintf(stderr, "[vcache] off: arena allocation failed hr=0x%08lX\n",
+            (unsigned long)hr);
+    if (g_vc_vb) { g_vc_vb->lpVtbl->Release(g_vc_vb); g_vc_vb = NULL; }
+    if (g_vc_ib) { g_vc_ib->lpVtbl->Release(g_vc_ib); g_vc_ib = NULL; }
+    g_vc_vb_mapped = g_vc_ib_mapped = NULL;
+}
+
+static void ld_vc_destroy(void)
+{
+    if (g_vc_vb) { g_vc_vb->lpVtbl->Release(g_vc_vb); g_vc_vb = NULL; }
+    if (g_vc_ib) { g_vc_ib->lpVtbl->Release(g_vc_ib); g_vc_ib = NULL; }
+    g_vc_vb_mapped = g_vc_ib_mapped = NULL;
+    rsx_vcache_destroy(&g_vc);
+    g_vc_on = 0;
+}
+
 static void fetch_batches_hoisted(
     const rsx_vertex_layout_plan* layout, int packed_payload)
 {
@@ -6485,6 +6748,8 @@ refs_ready:
         (rsx_vertex_guest_ptr_fn)g.guest_ptr, g.guest_user);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
+    if (packed_payload)
+        ld_vc_note_ranges();
     for (u32 slot = 0; slot < layout->count; slot++) {
         const u32 attr = layout->attrs[slot];
         if (dc.fetch_plan.attr[attr].desc.frequency >= 2)
@@ -8333,6 +8598,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_profile.total_used_attribute_max = used_layout.count;
     const LONGLONG fetch_pack_begin = ld_profile_qpc();
 #endif
+    /* Converted-vertex cache: a HIT skips everything up to the draw call. */
+    ld_vc_begin(prim, &used_layout, g_ld_movie_mode);
+    int indexed = 0;
+    u32 n_tri = 0;
+    if (g_vcd.action == RSX_VCACHE_HIT) {
+        indexed = g_vcd.entry->indexed;
+        n_tri = g_vcd.entry->draw_count;
+        dc.n_verts = g_vcd.entry->vertex_count;
+        dc.n_source_refs = g_vcd.entry->source_refs;
+    } else {
     if (ld_vertex_compact_payload()) {
         fetch_batches_hoisted(&used_layout, 1);
     } else if (ld_vertex_hoist_fetch()) {
@@ -8352,12 +8627,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 
     /* Preserve validated occurrence order while allowing repeated compact
      * vertex references to share one fetched and uploaded payload. */
-    int indexed = 0;
     if (!rsx_vertex_topology_plan(prim, dc.refs_remapped, &indexed)) {
         g_ld_stats.group_drop_primitive++;
         return;
     }
-    u32 n_tri = indexed
+    n_tri = indexed
         ? topology_index_count(prim)
         : dc.n_source_refs - dc.n_source_refs % 3;
 
@@ -8367,6 +8641,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     }
 
     live_a010_geom_trace(prim, n_tri);
+    }   /* not a cache hit */
 
     const u32 vertex_stride =
         ld_vertex_compact_payload() ? used_layout.stride : VERT_STRIDE;
@@ -8381,10 +8656,40 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_stats.group_drop_ring++;
         return;
     }
+    /* Where this draw's vertices and indices live: the cache arena (HIT, or
+     * a FILL that got arena space) or the per-frame ring (everything else). */
+    u32 vc_vb_offset = 0, vc_ib_offset = 0;
+    if (g_vcd.action == RSX_VCACHE_HIT) {
+        vc_vb_offset = g_vcd.entry->vb_offset;
+        vc_ib_offset = g_vcd.entry->ib_offset;
+    } else if (g_vcd.action == RSX_VCACHE_FILL &&
+               (!g_vcd.n_ranges ||
+                !rsx_vcache_alloc(&g_vc, (u32)draw_vb_bytes,
+                                  (u32)draw_ib_bytes,
+                                  &vc_vb_offset, &vc_ib_offset))) {
+        ld_vc_bypass();
+    }
+    const int use_arena = g_vcd.action != RSX_VCACHE_BYPASS;
     /* Nothing of this draw is recorded yet: the same point the ring-full
      * flush below uses, so splitting the list here loses no state. */
     ld_kick_maybe();
     if (!g.ready) return;
+    if (use_arena) {
+        if (g_vcd.action == RSX_VCACHE_FILL) {
+            if (draw_vb_bytes)
+                memcpy(g_vc_vb_mapped + vc_vb_offset, vertex_data,
+                       (size_t)draw_vb_bytes);
+            if (indexed)
+                write_topology_indices(
+                    prim, (u32*)(g_vc_ib_mapped + vc_ib_offset));
+            rsx_vcache_commit(
+                &g_vc, g_vcd.entry, g_vcd.index_hash, g_vcd.vertex_hash,
+                g_vcd.ranges, g_vcd.n_ranges,
+                vc_vb_offset, (u32)draw_vb_bytes,
+                vc_ib_offset, (u32)draw_ib_bytes,
+                n_tri, dc.n_verts, dc.n_source_refs, indexed);
+        }
+    } else {
     if ((u64)g.vb_used + draw_vb_bytes > vb_capacity ||
         (u64)g.ib_used + draw_ib_bytes > INDEX_BUFFER_SIZE) {
         /*
@@ -8409,6 +8714,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     if (indexed)
         write_topology_indices(
             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
+    }   /* ring upload */
 
     ID3D12PipelineState* pso = get_pso(
         ld_vertex_mask_signature() ? &used_layout : NULL,
@@ -9116,7 +9422,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g.list, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
 
     D3D12_VERTEX_BUFFER_VIEW vbv;
-    vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
+    vbv.BufferLocation = use_arena
+        ? g_vc_vb->lpVtbl->GetGPUVirtualAddress(g_vc_vb) + vc_vb_offset
+        : g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
     vbv.StrideInBytes = vertex_stride;
     vbv.SizeInBytes = (u32)draw_vb_bytes;
     if (vertex_stride)
@@ -9156,8 +9464,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     }
     if (indexed) {
         D3D12_INDEX_BUFFER_VIEW ibv;
-        ibv.BufferLocation =
-            g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
+        ibv.BufferLocation = use_arena
+            ? g_vc_ib->lpVtbl->GetGPUVirtualAddress(g_vc_ib) + vc_ib_offset
+            : g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
         ibv.SizeInBytes = (u32)draw_ib_bytes;
         ibv.Format = DXGI_FORMAT_R32_UINT;
         g.list->lpVtbl->IASetIndexBuffer(g.list, &ibv);
@@ -9239,8 +9548,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             fflush(stderr);
         }
     }
-    g.vb_used += (u32)draw_vb_bytes;
-    g.ib_used += (u32)draw_ib_bytes;
+    if (!use_arena) {
+        g.vb_used += (u32)draw_vb_bytes;
+        g.ib_used += (u32)draw_ib_bytes;
+    }
     ld_profile_note_ring_highwater();
 }
 
@@ -9765,6 +10076,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
         D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g.ib);
     g.ib->lpVtbl->Map(g.ib, 0, &rr, (void**)&g.ib_mapped);
+    ld_vc_create();
 
     bd.Width = CB_RING_BYTES;
     g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
@@ -10984,6 +11296,7 @@ void rsx_live_draw_present(u32 buffer_id)
 
     if (g_ld_movie_mode) ld_flush(LD_FLUSH_PRESENT);
     else                 ld_flush_present_async();
+    ld_vc_frame_end();
     ld_black_dbg_check();
     {
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
@@ -11769,7 +12082,24 @@ void rsx_live_draw_present(u32 buffer_id)
                     g_ld_vtx_span_draws / frames, g_ld_vtx_array_draws / frames,
                     g_ld_vtx_other_draws / frames);
             g_ld_vtx_refs = g_ld_vtx_fetched = 0;
-            g_ld_vtx_span_draws = g_ld_vtx_array_draws = g_ld_vtx_other_draws = 0; }
+            g_ld_vtx_span_draws = g_ld_vtx_array_draws = g_ld_vtx_other_draws = 0;
+            if (g_vc_on) {
+                const rsx_vcache_stats* s = &g_vc.stats;
+                fprintf(stderr,
+                        "[vcache] per frame: hit %.0f fill %.0f changed %.1f volatile %.0f bypass %.0f"
+                        " | hashed %.1f MB filled %.2f MB | arena vb %u/%u MB ib %u/%u MB"
+                        " slots %u | resets %llu\n",
+                        s->hits / frames, s->fills / frames, s->changed / frames,
+                        s->volatile_skips / frames, s->bypass / frames,
+                        s->hashed_bytes / frames / 1048576.0,
+                        s->filled_bytes / frames / 1048576.0,
+                        g_vc.vb_used >> 20, g_vc.vb_capacity >> 20,
+                        g_vc.ib_used >> 20, g_vc.ib_capacity >> 20,
+                        g_vc.slot_used, (unsigned long long)s->resets);
+                const u64 resets = s->resets;
+                memset(&g_vc.stats, 0, sizeof(g_vc.stats));
+                g_vc.stats.resets = resets;
+            } }
           fps_t0 = now; fps_f0 = g_ld_frames;
       } }
     /* RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --
@@ -12157,6 +12487,7 @@ void rsx_live_draw_shutdown(void)
         g_ld_profile.adapter = NULL;
     }
 #endif
+    ld_vc_destroy();
     if (g.dev) g.dev->lpVtbl->Release(g.dev);
     memset(&g, 0, sizeof(g));
     if (dc.verts) { free(dc.verts); dc.verts = NULL; dc.cap_verts = 0; }
