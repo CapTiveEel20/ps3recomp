@@ -412,11 +412,13 @@ void rsx_null_backend_shutdown(void)
  * the total seconds played; loaded once, saved every 30 s and when the window
  * closes (replace-by-rename, so a crash mid-write keeps the old total). Unset =
  * this session only. Time counts while the window exists; a gap over 5 s
- * between pumps (PC asleep, debugger) counts as 5 s. */
+ * between pumps (PC asleep, debugger) counts as 5 s. The caption shows the
+ * total and, next to it, this session alone (never saved: 0 at every start). */
 static struct {
     int       loaded;
     wchar_t   path[MAX_PATH];
     u64       ms;          /* total played, milliseconds */
+    u64       session_ms;  /* this run only */
     ULONGLONG last_tick, last_save;
 } s_play;
 
@@ -450,6 +452,7 @@ static u64 null_playtime_tick(ULONGLONG now)
     ULONGLONG d = now - s_play.last_tick;
     if (d > 5000) d = 5000;
     s_play.ms += d;
+    s_play.session_ms += d;
     s_play.last_tick = now;
     if (now - s_play.last_save >= 30000) {
         null_playtime_save();
@@ -481,10 +484,14 @@ int rsx_null_backend_pump_messages(void)
                   (double)(now - s_state.title_time);
         const u64 played = null_playtime_tick(now);
         char tb[256];
-        snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | playtime: %lluh %02um %02us | %ux%u",
+        const u64 sess = s_play.session_ms / 1000u;
+        snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | playtime: %lluh %02um %02us | "
+                                 "session: %lluh %02um %02us | %ux%u",
                  s_state.title, fps, rsx_live_draw_get_last_draws(),
                  (unsigned long long)(played / 3600u), (unsigned)(played / 60u % 60u),
-                 (unsigned)(played % 60u), s_state.width, s_state.height);
+                 (unsigned)(played % 60u),
+                 (unsigned long long)(sess / 3600u), (unsigned)(sess / 60u % 60u),
+                 (unsigned)(sess % 60u), s_state.width, s_state.height);
         SetWindowTextA(s_state.hwnd, tb);
         s_state.title_frames = s_state.frame_count;
         s_state.title_time = now;
