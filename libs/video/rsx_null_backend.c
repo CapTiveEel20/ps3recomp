@@ -17,6 +17,57 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <propsys.h>
+
+/* ---------------------------------------------------------------------------
+ * Taskbar identity (opt-in, PS3_APP_ID)
+ *
+ * A port started through a launcher exe: pinning the game's taskbar button
+ * pins the runtime exe itself (no icon, needs the launcher's arguments). With
+ * PS3_APP_ID set, the window gets that AppUserModelID plus the relaunch
+ * properties (PS3_RELAUNCH_CMD, PS3_RELAUNCH_NAME, PS3_RELAUNCH_ICON), so a
+ * pin starts the launcher with its icon and the running game groups under
+ * that pin. Unset = nothing changes.
+ * -----------------------------------------------------------------------*/
+
+static void null_set_window_identity(HWND w)
+{
+    WCHAR id[256];
+    const DWORD idn = GetEnvironmentVariableW(L"PS3_APP_ID", id, 256);   /* wide, like below */
+    if (!w || !idn || idn >= 256) return;
+    typedef HRESULT (WINAPI *get_store_fn)(HWND, REFIID, void**);
+    HMODULE sh = LoadLibraryA("shell32.dll");
+    get_store_fn get_store = sh ? (get_store_fn)(void (*)(void))GetProcAddress(sh, "SHGetPropertyStoreForWindow") : NULL;
+    if (!get_store) return;
+    static const IID iid_store = {0x886d8eeb, 0x8cf2, 0x4446, {0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99}};
+    static const GUID fmt = {0x9F4C2855, 0x9F79, 0x4B39, {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}};
+    const HRESULT co = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    IPropertyStore* ps = NULL;
+    if (SUCCEEDED(get_store(w, &iid_store, (void**)&ps)) && ps) {
+        /* The relaunch properties count only with the ID set, and the command
+         * only with a display name. */
+        static const struct { const char* env; DWORD pid; } props[] = {
+            {"PS3_APP_ID", 5}, {"PS3_RELAUNCH_CMD", 2}, {"PS3_RELAUNCH_ICON", 3}, {"PS3_RELAUNCH_NAME", 4},
+        };
+        int set = 0;
+        for (int i = 0; i < 4; i++) {
+            WCHAR name[32], wv[1024];
+            MultiByteToWideChar(CP_ACP, 0, props[i].env, -1, name, 32);
+            const DWORD n = GetEnvironmentVariableW(name, wv, 1024);   /* wide: any path */
+            if (!n || n >= 1024) continue;
+            PROPERTYKEY key = {fmt, props[i].pid};
+            PROPVARIANT pv;
+            memset(&pv, 0, sizeof pv);
+            pv.vt = VT_LPWSTR;
+            pv.pwszVal = wv;
+            if (SUCCEEDED(ps->lpVtbl->SetValue(ps, &key, &pv))) set++;
+        }
+        ps->lpVtbl->Commit(ps);
+        ps->lpVtbl->Release(ps);
+        printf("[RSX null] taskbar identity '%ls' (%d properties)\n", id, set);
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+}
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -46,21 +97,76 @@ typedef struct {
 
 static NullBackendState s_state;
 
+static u64  null_playtime_tick(ULONGLONG now);   /* caption playtime, below */
+static void null_playtime_save(void);
+
 /* ---------------------------------------------------------------------------
  * Win32 window procedure
  * -----------------------------------------------------------------------*/
 
 static int s_present_suppressed = 0;
 
+/* Borderless fullscreen (Alt+Enter, or PS3RECOMP_FULLSCREEN=1 at start): the
+ * window just covers its monitor and the swap chain stretches its buffers to
+ * it, so the renderer needs no resize. DXGI's own Alt+Enter (exclusive
+ * fullscreen) is turned off by the swap-chain owner: the live renderer never
+ * resizes its buffers, and after such a switch Present failed with
+ * DXGI_ERROR_INVALID_CALL and the picture froze. */
+static struct {
+    int on;
+    LONG style;
+    WINDOWPLACEMENT placement;
+} s_fullscreen;
+
+static void null_toggle_fullscreen(HWND hwnd)
+{
+    if (!s_fullscreen.on) {
+        MONITORINFO mi = { sizeof(mi) };
+        s_fullscreen.placement.length = sizeof(s_fullscreen.placement);
+        if (!GetWindowPlacement(hwnd, &s_fullscreen.placement) ||
+            !GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        s_fullscreen.style = GetWindowLongA(hwnd, GWL_STYLE);
+        SetWindowLongA(hwnd, GWL_STYLE,
+                       (s_fullscreen.style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        s_fullscreen.on = 1;
+    } else {
+        SetWindowLongA(hwnd, GWL_STYLE, s_fullscreen.style);
+        SetWindowPlacement(hwnd, &s_fullscreen.placement);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        s_fullscreen.on = 0;
+    }
+}
+
 static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_SYSKEYDOWN:
+        /* Alt+Enter; bit 29 = Alt held, bit 30 = key auto-repeat. */
+        if (wp == VK_RETURN && (lp & (1 << 29)) && !(lp & (1 << 30))) {
+            null_toggle_fullscreen(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_SYSCHAR:
+        if (wp == VK_RETURN) return 0;   /* no "ding" for Alt+Enter */
+        break;
+
     case WM_CLOSE:
         s_state.window_closed = 1;
         DestroyWindow(hwnd);
         return 0;
 
     case WM_DESTROY:
+        null_playtime_tick(GetTickCount64());
+        null_playtime_save();
         PostQuitMessage(0);
         return 0;
 
@@ -263,6 +369,14 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
         printf("[RSX null] ERROR: CreateWindow failed (%lu)\n", GetLastError());
         return -1;
     }
+    null_set_window_identity(s_state.hwnd);
+    memset(&s_fullscreen, 0, sizeof(s_fullscreen));
+    {   /* PS3RECOMP_FULLSCREEN=1: start borderless fullscreen (same name as
+         * the Vulkan backend's --fullscreen). */
+        const char* fs = getenv("PS3RECOMP_FULLSCREEN");
+        if (fs && fs[0] == '1')
+            null_toggle_fullscreen(s_state.hwnd);
+    }
 
     s_state.hdc = GetDC(s_state.hwnd);
     s_state.last_fps_time = GetTickCount64();
@@ -294,6 +408,56 @@ void rsx_null_backend_shutdown(void)
            (unsigned long long)s_state.frame_count);
 }
 
+/* Playtime shown in the caption. PS3_PLAYTIME_FILE=<path>: a text file holding
+ * the total seconds played; loaded once, saved every 30 s and when the window
+ * closes (replace-by-rename, so a crash mid-write keeps the old total). Unset =
+ * this session only. Time counts while the window exists; a gap over 5 s
+ * between pumps (PC asleep, debugger) counts as 5 s. */
+static struct {
+    int       loaded;
+    wchar_t   path[MAX_PATH];
+    u64       ms;          /* total played, milliseconds */
+    ULONGLONG last_tick, last_save;
+} s_play;
+
+static void null_playtime_save(void)
+{
+    if (!s_play.loaded || !s_play.path[0]) return;
+    wchar_t tmp[MAX_PATH + 8];
+    _snwprintf_s(tmp, MAX_PATH + 8, _TRUNCATE, L"%s.tmp", s_play.path);
+    FILE* f = _wfopen(tmp, L"w");
+    if (!f) return;
+    fprintf(f, "%llu\n", (unsigned long long)(s_play.ms / 1000u));
+    const int ok = fclose(f) == 0;
+    if (ok) MoveFileExW(tmp, s_play.path, MOVEFILE_REPLACE_EXISTING);
+}
+
+static u64 null_playtime_tick(ULONGLONG now)
+{
+    if (!s_play.loaded) {
+        s_play.loaded = 1;
+        DWORD n = GetEnvironmentVariableW(L"PS3_PLAYTIME_FILE", s_play.path, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) s_play.path[0] = 0;
+        if (s_play.path[0]) {
+            FILE* f = _wfopen(s_play.path, L"r");
+            unsigned long long secs = 0;
+            if (f) { if (fscanf(f, "%llu", &secs) != 1) secs = 0; fclose(f); }
+            s_play.ms = (u64)secs * 1000u;
+            printf("[RSX null] playtime %llu s from file\n", secs);
+        }
+        s_play.last_tick = s_play.last_save = now;
+    }
+    ULONGLONG d = now - s_play.last_tick;
+    if (d > 5000) d = 5000;
+    s_play.ms += d;
+    s_play.last_tick = now;
+    if (now - s_play.last_save >= 30000) {
+        null_playtime_save();
+        s_play.last_save = now;
+    }
+    return s_play.ms / 1000u;
+}
+
 int rsx_null_backend_pump_messages(void)
 {
     MSG msg;
@@ -315,9 +479,12 @@ int rsx_null_backend_pump_messages(void)
         if (fps <= 0.0)
             fps = (s_state.frame_count - s_state.title_frames) * 1000.0 /
                   (double)(now - s_state.title_time);
+        const u64 played = null_playtime_tick(now);
         char tb[256];
-        snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u", s_state.title, fps,
-                 rsx_live_draw_get_last_draws(), s_state.width, s_state.height);
+        snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | playtime: %lluh %02um %02us | %ux%u",
+                 s_state.title, fps, rsx_live_draw_get_last_draws(),
+                 (unsigned long long)(played / 3600u), (unsigned)(played / 60u % 60u),
+                 (unsigned)(played % 60u), s_state.width, s_state.height);
         SetWindowTextA(s_state.hwnd, tb);
         s_state.title_frames = s_state.frame_count;
         s_state.title_time = now;
