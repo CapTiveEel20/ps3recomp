@@ -930,7 +930,7 @@ static int rsx_fp_decompile_internal(
             dbg_done = 1;
         }
         /* Build the RHS expression for this opcode. */
-        char rhs[640];
+        char rhs[1024];  /* OP_NRM repeats its operand (<200 chars) 4x */
         int handled = 1;
         switch (opcode) {
         case OP_NOP: rhs[0] = '\0'; handled = 0; break;
@@ -992,7 +992,19 @@ static int rsx_fp_decompile_internal(
                      a, a, b);
             break;
         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
-        case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
+        /* Zero-length input returns the input unchanged instead of NaN
+         * (oracle: RPCS3 FragmentProgramDecompiler.cpp
+         * "#define _builtin_normalize(x) (length(x) > 0? normalize(x) : x)").
+         * CivRev's city-wall draw (func_00062094) never fills its
+         * g_f4x4NormalRotation slot, so the wall normal is ~0: a plain
+         * normalize() gave NaN, the env cubes then sampled a bright face and
+         * the walls turned orange/white. With the guard the reflection
+         * vector degenerates to the view direction, as on RPCS3. */
+        case OP_NRM:
+            snprintf(rhs, sizeof(rhs),
+                     "float4(dot((%s).xyz, (%s).xyz) > 0.0 ? normalize((%s).xyz) : (%s).xyz, 1.0)",
+                     a, a, a, a);
+            break;
         case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
         /* Lighting coefficients: (1, y, y > 0 ? 2^w : 0, 1) (RPCS3
          * FragmentProgramDecompiler, RSX_FP_OPCODE_LIF). */
@@ -1155,14 +1167,14 @@ static int rsx_fp_decompile_internal(
             if (has_dest && is_uncond && !set_cond) {
                 /* Common unconditional path — kept byte-identical so the 39
                  * non-predicated programs in this capture emit unchanged. */
-                char line[800];
+                char line[1200];
                 snprintf(line, sizeof(line),
                          "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
                          rhs, scale_txt[res_scale], sat, reg, dst_idx, m, m);
                 out_puts(&o, line);
             } else {
                 /* Predicated and/or CC-writing instruction. */
-                char buf[1200];
+                char buf[1400];
                 snprintf(buf, sizeof(buf),
                          "    { float4 _v = (float4)(%s)%s;%s\n",
                          rhs, scale_txt[res_scale], sat);
